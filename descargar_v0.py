@@ -57,7 +57,7 @@ class ThingsBoardClient:
 
     def get_customers(self):
         customers_url = f"{self.url}/api/customers?pageSize=1000&page=0"
-        print(f"Obteniendo clientes desde: {customers_url}")
+        print(f"Obteniendo clientes") # desde: {customers_url}")
         response = requests.get(customers_url, headers=self._get_headers())
         if response.status_code == 200:
             customers = response.json().get('data', [])
@@ -70,12 +70,12 @@ class ThingsBoardClient:
     def get_gateways_for_customer(self, customer_id):
         customer_id_str = customer_id.get('id') if isinstance(customer_id, dict) else customer_id
         gateways_url = f"{self.url}/api/customer/{customer_id_str}/devices?pageSize=1000&page=0"
-        print(f"Obteniendo dispositivos para el cliente {customer_id_str} desde: {gateways_url}")
+        print(f"Obteniendo dispositivos para el cliente") # {customer_id_str} desde: {gateways_url}")
         response = requests.get(gateways_url, headers=self._get_headers())
         if response.status_code == 200:
             all_devices = response.json().get('data', [])
             gateways = [device for device in all_devices if device.get('additionalInfo', {}).get('gateway', False)]
-            print(f"Gateways obtenidos para el cliente {customer_id_str}: {len(gateways)}")
+            print(f"Gateways obtenidos para el cliente, {len(gateways)}") #{customer_id_str}: {len(gateways)}")
             return gateways
         else:
             print(f"Error al obtener gateways para el cliente {customer_id_str}: {response.status_code} - {response.text}")
@@ -83,11 +83,11 @@ class ThingsBoardClient:
 
     def get_devices_for_gateway(self, gateway_id):
         devices_url = f"{self.url}/api/tenant/devices?gatewayId={gateway_id}&pageSize=1000&page=0"
-        print(f"Obteniendo dispositivos para el gateway {gateway_id} desde: {devices_url}")
+        print(f"Obteniendo dispositivos para el gateway") #{gateway_id} desde: {devices_url}")
         response = requests.get(devices_url, headers=self._get_headers())
         if response.status_code == 200:
             devices = response.json().get('data', [])
-            print(f"Dispositivos obtenidos para el gateway {gateway_id}: {len(devices)}")
+            print(f"Dispositivos obtenidos para el gateway {len(devices)}")  #{gateway_id}: {len(devices)}")
             return devices
         else:
             print(f"Error al obtener dispositivos para el gateway {gateway_id}: {response.status_code} - {response.text}")
@@ -115,7 +115,7 @@ class ThingsBoardClient:
 
             gateways = self.get_gateways_for_customer(customer_id)
             if not gateways:
-                print(f"No se encontraron gateways para el cliente {customer_name} ({customer_id})")
+                print(f"No se encontraron gateways para el cliente {customer_name}") # ({customer_id})")
             for gateway in gateways:
                 gateway_name = gateway.get('name')
                 gateway_id = gateway.get('id').get('id')
@@ -130,7 +130,7 @@ class ThingsBoardClient:
 
                 devices = self.get_devices_for_gateway(gateway_id)
                 if not devices:
-                    print(f"No se encontraron dispositivos para el gateway {gateway_name} ({gateway_id})")
+                    print(f"No se encontraron dispositivos para el gateway {gateway_name}") # ({gateway_id})")
                 for device in devices:
                     device_name = device.get('name')
                     print(f"Organizando directorio para el dispositivo: {device_name}")
@@ -155,7 +155,7 @@ class ThingsBoardClient:
 
             gateways = self.get_gateways_for_customer(customer_id)
             if not gateways:
-                print(f"No se encontraron gateways para el cliente {customer_name} ({customer_id})")
+                print(f"No se encontraron gateways para el cliente {customer_name}") #({customer_id})")
                 continue
 
             for gateway in tqdm(gateways, desc=f"Procesando gateways de {customer_name}", leave=False):
@@ -166,14 +166,14 @@ class ThingsBoardClient:
 
                 devices = self.get_devices_for_gateway(gateway_id)
                 if not devices:
-                    print(f"No se encontraron dispositivos para el gateway {gateway_name} ({gateway_id})")
+                    print(f"No se encontraron dispositivos para el gateway {gateway_name}") # ({gateway_id})")
                     continue
 
                 for device in devices:
                     device_name = device.get('name')
                     device_id = device['id']['id']
                     keys = self.get_telemetry_keys(device_id)
-                    print(f"Descargando telemetría para el dispositivo: {device_name} ({device_id})")
+                    print(f"Descargando telemetría para el dispositivo: {device_name}") # ({device_id})")
 
                     # Establecer el rango de tiempo para la descarga de telemetría
                     start_ts = int(datetime(2024, 9, 1).timestamp() * 1000)  # Fecha de inicio predeterminada
@@ -194,7 +194,7 @@ class ThingsBoardClient:
                                     # Convertir el último timestamp a milisegundos
                                     last_ts = int(datetime.strptime(last_row['timestamp'], '%Y-%m-%d %H:%M:%S').timestamp() * 1000)
                                     start_ts = last_ts + 1  # Evitar duplicados al iniciar desde el siguiente timestamp
-                                    print(f"Último timestamp encontrado: {last_row['timestamp']}. Continuando desde {datetime.fromtimestamp(start_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}.")
+                                    #print(f"Último timestamp encontrado: {last_row['timestamp']}. Continuando desde {datetime.fromtimestamp(start_ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}.")
                                 except ValueError:
                                     print(f"Error al leer el último timestamp. Se usará la fecha de inicio predeterminada.")
                     else:
