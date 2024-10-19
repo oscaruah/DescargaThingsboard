@@ -94,6 +94,55 @@ class ThingsBoardClient:
             tqdm.write(f"Error al obtener dispositivos para el gateway {gateway_id}: {response.status_code} - {response.text}")
             return []
 
+
+    def organize_directories(self):
+        print("Organizando directorios de clientes, gateways y dispositivos...")
+        customers = self.get_customers()
+        base_directory = 'thingsboard_data'
+        if not os.path.exists(base_directory):
+            os.makedirs(base_directory)
+
+        for customer in tqdm(customers, desc="Organizando directorios de clientes"):
+            customer_name = customer.get('title')
+            customer_id = customer.get('id')
+            print(f"Organizando directorio para el cliente: {customer_name}")
+            customer_dir = os.path.join(base_directory, customer_name)
+            if not os.path.exists(customer_dir):
+                os.makedirs(customer_dir)
+
+            customer_file = os.path.join(customer_dir, f"{customer_name}_customer.json")
+            with open(customer_file, 'w') as file:
+                json.dump(customer, file, indent=4)
+
+            gateways = self.get_gateways_for_customer(customer_id)
+            if not gateways:
+                print(f"No se encontraron gateways para el cliente {customer_name} ({customer_id})")
+            for gateway in gateways:
+                gateway_name = gateway.get('name')
+                gateway_id = gateway.get('id').get('id')
+                print(f"Organizando directorio para el gateway: {gateway_name}")
+                gateway_dir = os.path.join(customer_dir, gateway_name)
+                if not os.path.exists(gateway_dir):
+                    os.makedirs(gateway_dir)
+
+                gateway_file = os.path.join(gateway_dir, f"{gateway_name}_gateway.json")
+                with open(gateway_file, 'w') as file:
+                    json.dump(gateway, file, indent=4)
+
+                devices = self.get_devices_for_gateway(gateway_id)
+                if not devices:
+                    print(f"No se encontraron dispositivos para el gateway {gateway_name} ({gateway_id})")
+                for device in devices:
+                    device_name = device.get('name')
+                    print(f"Organizando directorio para el dispositivo: {device_name}")
+                    device_dir = os.path.join(gateway_dir, device_name)
+                    if not os.path.exists(device_dir):
+                        os.makedirs(device_dir)
+                    
+                    device_file = os.path.join(device_dir, f"{device_name}_device.json")
+                    with open(device_file, 'w') as file:
+                        json.dump(device, file, indent=4)
+
     def get_telemetry_keys(self, device_id):
         url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/keys/timeseries"
         headers = {
