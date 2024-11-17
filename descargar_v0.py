@@ -8,7 +8,7 @@ import pytz  # Para manejo de zonas horarias
 from tqdm import tqdm
 
 class ThingsBoardClient:
-    def __init__(self, config_file='config.json', token_file='token.json'):
+    def __init__(self, config_file='config.json', token_file='token.json',customer_name=None):
         config_path = '/mnt/thingsboard_data/Descargas/' + config_file  #os.path.abspath(config_file)
         if os.path.exists(config_path):
             tqdm.write(f"Leyendo configuración desde: {os.path.basename(config_file)}")
@@ -28,6 +28,7 @@ class ThingsBoardClient:
             exit(1)
 
         self.token_file = token_file
+        self.customer_name = customer_name #numero parametro para filtrar clientes
         self.token = None
         self._authenticate()
 
@@ -58,40 +59,70 @@ class ThingsBoardClient:
 
     def get_customers(self):
         customers_url = f"{self.url}/api/customers?pageSize=1000&page=0"
-        tqdm.write("Obteniendo clientes...") 
+        tqdm.write("Obteniendo clientes...")
         response = requests.get(customers_url, headers=self._get_headers())
         if response.status_code == 200:
             customers = response.json().get('data', [])
-            tqdm.write(f"Clientes obtenidos: {len(customers)}")
+            if self.customer_name:
+                customers = [customer for customer in customers if customer.get('title') == self.customer_name]
+                tqdm.write(f"Clientes filtrados por nombre '{self.customer_name}': {len(customers)} encontrado(s).")
+            else:
+                tqdm.write(f"Clientes obtenidos: {len(customers)}")
             return customers
         else:
             tqdm.write(f"Error al obtener clientes: {response.status_code} - {response.text}")
             return []
 
+
+
     def get_gateways_for_customer(self, customer_id):
-        customer_id_str = customer_id.get('id') if isinstance(customer_id, dict) else customer_id
+        customer_id_str = customer_id['id'] if isinstance(customer_id, dict) else customer_id
         gateways_url = f"{self.url}/api/customer/{customer_id_str}/devices?pageSize=1000&page=0"
-        tqdm.write(f"Obteniendo dispositivos para el cliente {customer_id_str}...")
-        response = requests.get(gateways_url, headers=self._get_headers())
-        if response.status_code == 200:
+        tqdm.write(f"Obteniendo dispositivos (gateways) para el cliente {customer_id_str}...")
+
+        try:
+            response = requests.get(gateways_url, headers=self._get_headers())
+            response.raise_for_status()  # Lanza excepción si hay error
             all_devices = response.json().get('data', [])
+          
+            # Depuración: Mostrar todos los dispositivos obtenidos
+        #    tqdm.write(f"Dispositivos obtenidos para cliente {customer_id_str}: {len(all_devices)}")
+         #   for device in all_devices:
+          #      tqdm.write(f"Dispositivo: {device.get('name')}, tipo: {device.get('type')}, info adicional: {device.get('additionalInfo')}")
+
+            # Filtrar dispositivos marcados como 'gateway'
             gateways = [device for device in all_devices if device.get('additionalInfo', {}).get('gateway', False)]
-            tqdm.write(f"Gateways obtenidos para el cliente: {len(gateways)}")
+            tqdm.write(f"Gateways filtrados: {len(gateways)}")
             return gateways
-        else:
-            tqdm.write(f"Error al obtener gateways para el cliente {customer_id_str}: {response.status_code} - {response.text}")
+        except requests.exceptions.RequestException as e:
+            tqdm.write(f"Error al obtener gateways para el cliente {customer_id_str}: {e}")
             return []
 
-    def get_devices_for_gateway(self, gateway_id):
-        devices_url = f"{self.url}/api/tenant/devices?gatewayId={gateway_id}&pageSize=1000&page=0"
-        tqdm.write(f"Obteniendo dispositivos para el gateway {gateway_id}...")
-        response = requests.get(devices_url, headers=self._get_headers())
-        if response.status_code == 200:
-            devices = response.json().get('data', [])
-            tqdm.write(f"Dispositivos obtenidos para el gateway: {len(devices)}")
-            return devices
-        else:
-            tqdm.write(f"Error al obtener dispositivos para el gateway {gateway_id}: {response.status_code} - {response.text}")
+    def get_devices_for_gateway(self, gateway_id, customer_id):
+        """
+        Obtiene dispositivos asociados al gateway basado en el cliente y el atributo `lastConnectedGateway`.
+        """
+        customer_id_str = customer_id['id'] if isinstance(customer_id, dict) else customer_id
+        devices_url = f"{self.url}/api/customer/{customer_id_str}/devices?pageSize=1000&page=0"
+        tqdm.write(f"Obteniendo dispositivos para el cliente {customer_id} y el gateway {gateway_id}...")
+
+        try:
+            # Obtener todos los dispositivos asignados al cliente
+            response = requests.get(devices_url, headers=self._get_headers())
+            response.raise_for_status()
+            customer_devices = response.json().get('data', [])
+
+            # Filtrar dispositivos por `lastConnectedGateway`
+            associated_devices = [
+                device for device in customer_devices
+                if device.get('additionalInfo', {}).get('lastConnectedGateway') == gateway_id
+            ]
+            for device in associated_devices:
+                tqdm.write(f"Dispositivo asociado al gateway {gateway_id}: {device.get('name')}") 
+            tqdm.write(f"Dispositivos asociados al gateway {gateway_id}: {len(associated_devices)}")
+            return associated_devices
+        except requests.exceptions.RequestException as e:
+            tqdm.write(f"Error al obtener dispositivos para el cliente {customer_id} y gateway {gateway_id}: {e}")
             return []
 
 
@@ -129,7 +160,7 @@ class ThingsBoardClient:
                 with open(gateway_file, 'w') as file:
                     json.dump(gateway, file, indent=4)
 
-                devices = self.get_devices_for_gateway(gateway_id)
+                devices = self.get_devices_for_gateway(gateway_id,customer_id)
                 if not devices:
                     print(f"No se encontraron dispositivos para el gateway {gateway_name} ({gateway_id})")
                 for device in devices:
@@ -201,6 +232,10 @@ class ThingsBoardClient:
     def download_telemetries(self):
         tqdm.write("Descargando telemetría de dispositivos...")
         customers = self.get_customers()
+        if not customers:
+            tdqm.write(f"No se encontraron clientes con el nombre especificado: {self.customer_name}")
+            return
+
         base_directory = 'thingsboard_data'
         report = []  # Lista para almacenar el reporte final de archivos descargados
 
@@ -220,7 +255,7 @@ class ThingsBoardClient:
                 gateway_id = gateway.get('id').get('id')
                 gateway_dir = os.path.join(customer_dir, gateway_name)
 
-                devices = self.get_devices_for_gateway(gateway_id)
+                devices = self.get_devices_for_gateway(gateway_id,customer_id)
                 if not devices:
                     tqdm.write(f"No se encontraron dispositivos para el gateway {gateway_name}")
                     continue
@@ -332,15 +367,58 @@ class ThingsBoardClient:
         for entry in report:
             tqdm.write(f"Archivo: {entry['file']}, Registros: {entry['records']}, Tamaño: {entry['size_kb']:.2f} KB")
 
+
+    def generate_user_device_tree(self, output_file="user_device_tree.json"):
+        """Genera un archivo JSON con el árbol jerárquico de clientes, gateways y dispositivos."""
+        tqdm.write("Generando árbol de usuarios y dispositivos...")
+        customers = self.get_customers()
+        tree = []
+
+        for customer in tqdm(customers, desc="Procesando clientes"):
+            customer_data = {
+            'name': customer.get('title'),
+            'id': customer.get('id'),
+            'gateways': []
+            }
+
+            gateways = self.get_gateways_for_customer(customer.get('id'))
+            for gateway in gateways:
+                gateway_data = {
+                'name': gateway.get('name'),
+                'id': gateway.get('id').get('id'),
+                'devices': []
+            }
+
+                devices = self.get_devices_for_gateway(gateway.get('id').get('id'),customer.get('id'))
+                for device in devices:
+                    gateway_data['devices'].append({
+                    'name': device.get('name'),
+                    'id': device.get('id').get('id')
+                })
+
+                customer_data['gateways'].append(gateway_data)
+
+            tree.append(customer_data)
+        output_file = customer.get('title')+'_device_tree.json'
+        # Guardar el árbol en un archivo JSON
+        with open(output_file, "w") as json_file:
+            json.dump(tree, json_file, indent=4)
+        tqdm.write(f"Árbol de usuarios y dispositivos guardado en '{output_file}'")
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ThingsBoard Data Organizer')
-    parser.add_argument('command', choices=['organize', 'download'], help='Command to execute')
+    parser.add_argument('command', choices=['organize', 'download','tree'], help='Command to execute')
+    parser.add_argument('--customer', type=str, help='Nombre del cliente para filtrar')
+
     args = parser.parse_args()
 
-    client = ThingsBoardClient()
+    client = ThingsBoardClient(customer_name=args.customer)
 
     if args.command == 'organize':
         client.organize_directories()
     elif args.command == 'download':
         client.download_telemetries()
-
+    elif args.command == 'tree':
+        client.generate_user_device_tree()
