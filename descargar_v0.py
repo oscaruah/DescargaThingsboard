@@ -6,6 +6,9 @@ import argparse
 from datetime import datetime, timezone
 import pytz  # Para manejo de zonas horarias
 from tqdm import tqdm
+import numpy as np
+from scipy.interpolate import interp1d
+
 
 class ThingsBoardClient:
     def __init__(self, config_file='config.json', token_file='token.json',customer_name=None):
@@ -259,7 +262,6 @@ class ThingsBoardClient:
                 if not devices:
                     tqdm.write(f"No se encontraron dispositivos para el gateway {gateway_name}")
                     continue
-
                 for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
                     device_name = device.get('name')
                     device_id = device['id']['id']
@@ -273,7 +275,7 @@ class ThingsBoardClient:
 
                     # Mostrar la fecha y hora de la última telemetría almacenada
                     last_telemetry_time = self.get_last_telemetry_timestamp(csv_filename)
-                    tqdm.write(f"Última telemetría registrada para '{device_name}': {last_telemetry_time}")
+                    tqdm.write(f"Última telemetría registrada para '{device_name}'-'{device_id}': {last_telemetry_time}")
 
                     start_ts = int(datetime(2024, 9, 1).timestamp() * 1000)  # Fecha de inicio predeterminada
                     end_ts = int(datetime.now().timestamp() * 1000)  # Fecha actual como límite
@@ -296,6 +298,7 @@ class ThingsBoardClient:
 
                     limit = 50000
                     total_records = 0  # Para contar el número de registros (*timestamps * claves*)
+
                     all_data = {}
 
                     while True:
@@ -359,6 +362,13 @@ class ThingsBoardClient:
                             'records': total_records,
                             'size_kb': file_size
                         })
+
+                        # Llamar a la función para procesar y calibrar
+                        calibration_file = os.path.join(device_dir, 'calibracion.json')
+                        self.process_and_calibrate_telemetry(csv_filename, calibration_file)
+
+                        tqdm.write(f"Borrar telemetrias de dispositivo '{device_id}'");
+                        self.delete_telemetry(device_id, start_ts=None, end_ts=end_ts)
                     else:
                         tqdm.write(f"No se encontró telemetría para '{device_name}' en el rango de fechas especificado.")
 
@@ -404,6 +414,335 @@ class ThingsBoardClient:
         with open(output_file, "w") as json_file:
             json.dump(tree, json_file, indent=4)
         tqdm.write(f"Árbol de usuarios y dispositivos guardado en '{output_file}'")
+
+    def delete_telemetry(self, device_id, start_ts=None, end_ts=None):
+        """
+        Elimina telemetrías de un dispositivo entre un rango de fechas.
+        Si no se especifican fechas, se obtienen automáticamente del servidor.
+        """
+        # Obtener todas las claves de telemetría del dispositivo
+        keys = self.get_telemetry_keys(device_id)
+        if not keys:
+            tqdm.write(f"No se encontraron claves de telemetría para el dispositivo {device_id}. No se puede eliminar.")
+            return
+
+        # Obtener rango de tiempo si no se proporciona
+        if not start_ts or not end_ts:
+            calculated_start_ts, calculated_end_ts = self.get_time_range(device_id, keys)
+            start_ts = start_ts or calculated_start_ts
+            end_ts = end_ts or calculated_end_ts
+
+        # Validar que se hayan obtenido valores válidos
+        if not start_ts or not end_ts:
+            tqdm.write(f"No se pudo determinar un rango de tiempo para eliminar datos del dispositivo {device_id}.")
+            return
+
+        url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/delete"
+        headers = self._get_headers()
+
+        # Parámetros de la solicitud
+        params = {
+            'keys': ','.join(keys),  # Claves de telemetría separadas por comas
+            'startTs': start_ts,
+            'endTs': end_ts
+        }
+
+        try:
+            if start_ts is not None:
+                start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            else:
+                start_readable = "N/A"
+
+            if end_ts is not None:
+                end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            else:
+                end_readable = "N/A"
+ 
+            tqdm.write(f"Eliminando telemetrías para el dispositivo {device_id} entre {start_readable} y {end_readable} con claves: {keys}...")
+
+            response = requests.delete(url, headers=headers, params=params)
+            if response.status_code == 200:
+                tqdm.write(f"Telemetrías eliminadas para el dispositivo {device_id}.")
+            else:
+                tqdm.write(f"Error al eliminar telemetrías: {response.status_code} - {response.text}")
+        except requests.exceptions.RequestException as e:
+            tqdm.write(f"Error en la solicitud de eliminación para {device_id}: {e}")
+
+
+    def get_time_range_fijo(self, device_id, keys):
+        """
+        Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas,
+        partiendo siempre de un timestamp fijo de inicio (1 de septiembre de 2024).
+        """
+        # Fijar el timestamp inicial al 1 de septiembre de 2024 en milisegundos
+        fixed_start_ts = int(datetime(2024, 9, 1, 0, 0).timestamp() * 1000)
+        start_ts = fixed_start_ts
+        end_ts = None
+
+        for key in keys:
+            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
+            headers = self._get_headers()
+            
+            try:
+                # Parámetros para el último dato
+                params_end = {'keys': key, 'limit': 1, 'ascOrder': False}
+                response_end = requests.get(url, headers=headers, params=params_end)
+                response_end.raise_for_status()
+                data_end = response_end.json().get(key, [])
+                if data_end and 'ts' in data_end[0]:
+                    key_end_ts = data_end[0]['ts']
+                    end_ts = max(end_ts, key_end_ts) if end_ts else key_end_ts
+
+            except requests.exceptions.RequestException as e:
+                tqdm.write(f"Error al obtener el rango de tiempo para la clave {key}: {e}")
+
+        # Convertir timestamps a formato legible
+        start_readable = datetime.fromtimestamp(fixed_start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        end_readable = (
+            datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') 
+            if end_ts else "N/A"
+        )
+
+        # Mostrar los rangos calculados
+        tqdm.write(f"Rango de tiempo calculado: Inicio fijo: {start_readable}, Fin: {end_readable}")
+
+        return start_ts, end_ts
+
+    def get_time_range(self, device_id, keys):
+        """
+        Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas
+        y los imprime en formato legible.
+        """
+        start_ts = None
+        end_ts = None
+
+        for key in keys:
+            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
+            headers = self._get_headers()
+        
+            try:
+                # Parámetros para el primer dato
+                params_start = {'keys': key, 'limit': 1, 'ascOrder': True}
+                response_start = requests.get(url, headers=headers, params=params_start)
+                response_start.raise_for_status()
+                data_start = response_start.json().get(key, [])
+                if data_start and 'ts' in data_start[0]:
+                    key_start_ts = data_start[0]['ts']
+                    start_ts = min(start_ts, key_start_ts) if start_ts else key_start_ts
+
+                # Parámetros para el último dato
+                params_end = {'keys': key, 'limit': 1, 'ascOrder': False}
+                response_end = requests.get(url, headers=headers, params=params_end)
+                response_end.raise_for_status()
+                data_end = response_end.json().get(key, [])
+                if data_end and 'ts' in data_end[0]:
+                    key_end_ts = data_end[0]['ts']
+                    end_ts = max(end_ts, key_end_ts) if end_ts else key_end_ts
+
+            except requests.exceptions.RequestException as e:
+                tqdm.write(f"Error al obtener el rango de tiempo para la clave {key}: {e}")
+
+        # Convertir timestamps a formato legible
+        start_readable = (
+            datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') 
+            if start_ts else "N/A"
+        )
+        end_readable = (
+            datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') 
+            if end_ts else "N/A"
+        )
+
+        # Mostrar los rangos calculados
+        tqdm.write(f"Rango de tiempo calculado: Inicio: {start_readable}, Fin: {end_readable}")
+
+        return start_ts, end_ts
+
+    def get_time_range_old_V(self, device_id, keys):
+        """
+        Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas
+        y los imprime en formato legible.
+        """
+        start_ts = None
+        end_ts = None
+
+        for key in keys:
+            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries?keys={key}&limit=1"
+            headers = self._get_headers()
+
+            try:
+                # Obtener el primer dato (más antiguo)
+                response_start = requests.get(url, headers=headers, params={'ascOrder': True})
+                response_start.raise_for_status()
+                data_start = response_start.json().get(key, [])
+                if data_start:
+                    key_start_ts = data_start[0]['ts']
+                    if start_ts is None or key_start_ts < start_ts:
+                        start_ts = key_start_ts
+
+                # Obtener el último dato (más reciente)
+                response_end = requests.get(url, headers=headers, params={'ascOrder': False})
+                response_end.raise_for_status()
+                data_end = response_end.json().get(key, [])
+                if data_end:
+                    key_end_ts = data_end[0]['ts']
+                    if end_ts is None or key_end_ts > end_ts:
+                        end_ts = key_end_ts
+
+            except requests.exceptions.RequestException as e:
+                tqdm.write(f"Error al obtener el rango de tiempo para la clave {key}: {e}")
+
+        # Convertir timestamps a formato legible
+        if start_ts is not None:
+            start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        else:
+            start_readable = "N/A"
+
+        if end_ts is not None:
+            end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        else:
+            end_readable = "N/A"
+
+        # Mostrar los rangos calculados
+        tqdm.write(f"Rango de tiempo calculado: Inicio: {start_readable}, Fin: {end_readable}")
+
+        return start_ts, end_ts
+
+
+
+
+    def process_and_calibrate_telemetry(self, csv_filename, calibration_file=None):
+        """
+        Procesa el archivo de telemetría y crea un nuevo archivo terminado en `_cal`, recalibrando 
+        toda la tabla si el archivo de calibración ha cambiado.
+        """
+        if not os.path.exists(csv_filename):
+            tqdm.write(f"Archivo de telemetría no encontrado: {csv_filename}")
+            return
+
+        # Generar nombre del archivo calibrado
+      #  base, ext = os.path.splitext(csv_filename)
+      #  calibrated_csv_filename = f"{base}_cal{ext}"
+
+        # Verificar si se debe recalibrar
+        recalibrate_all = False
+        if calibration_file and os.path.exists(calibration_file):
+            try:
+                calib_mtime = os.path.getmtime(calibration_file)  # Última modificación del archivo de calibración
+                csv_mtime = os.path.getmtime(csv_filename) 
+
+                # Si el archivo de calibración es más reciente, recalibramos
+                if calib_mtime > csv_mtime:
+                    tqdm.write(f"Archivo de calibración más reciente encontrado. Recalibrando toda la tabla...")
+                    recalibrate_all = True
+            except Exception as e:
+                tqdm.write(f"Error al verificar el archivo de calibración: {e}")
+                return
+        else:
+            tqdm.write("Archivo de calibración no encontrado. No se aplicarán ajustes.")
+
+        # Leer el archivo CSV original
+        with open(csv_filename, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            rows = list(reader)  # Leer todas las filas
+            fieldnames = reader.fieldnames + ['current_cal', 'power_cal']
+            fieldnames = list(dict.fromkeys(fieldnames))  # Evitar duplicados
+
+
+        # Generar función de transferencia si hay un archivo de calibración
+        transfer_function = None
+        if calibration_file and os.path.exists(calibration_file):
+            try:
+                transfer_function = self.generate_transfer_function(calibration_file)
+            except Exception as e:
+                tqdm.write(f"Error al procesar el archivo de calibración: {e}")
+                return
+
+        # Procesar las filas y añadir las columnas calculadas
+        processed_rows = []
+        for row in rows:
+            try:
+                current = float(row.get('current', 0) or 0)
+                voltage = float(row.get('voltage', 0) or 0)
+            except ValueError:
+                current = 0
+                voltage = 0
+
+            # Verificar si la fila ya está calibrada
+            is_calibrated = (
+                 'current_cal' in row and 'power_cal' in row 
+                  and row['current_cal'] != '' and row['power_cal'] != ''
+            )
+
+            current_cal = None
+            power_cal = None
+
+            # Calcular `current_cal` y `power_cal` si hay función de transferencia
+            if transfer_function and (recalibrate_all or not is_calibrated):
+                try:
+                    if current > 0:
+                        current_cal = float(transfer_function(current))
+                        current_cal = round(current_cal,2)
+                        power_cal = round (voltage * current_cal,2)
+                    else:
+                        current_cal = 0
+                        power_cal = 0
+
+                except ValueError:
+                    current_cal = None
+                    power_cal = None
+
+            # Asignar las columnas calculadas
+            row['current_cal'] = current_cal if current_cal is not None else row.get('current_cal', '')
+            row['power_cal'] = power_cal if power_cal is not None else row.get('power_cal', '')
+            processed_rows.append(row)
+
+        # Escribir el archivo actualizado con las nuevas columnas
+        with open(csv_filename, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(processed_rows)
+
+        tqdm.write(f"Archivo calibrado y guardado en: {csv_filename}")
+
+
+    def generate_transfer_function(self,calibration_file):
+        """
+        Genera una función de transferencia a partir de un archivo de calibración.
+        """
+        with open(calibration_file, 'r') as f:
+            calibration_data = json.load(f)
+
+        # Extraer puntos de calibración
+        sensor_readings = [point['lectura_sensor'] for point in calibration_data['puntos_calibracion']]
+        real_values = [point['corriente_real'] for point in calibration_data['puntos_calibracion']]
+
+        # Verificar que los datos sean válidos
+        if len(sensor_readings) < 2 or len(real_values) < 2:
+            raise ValueError("La calibración requiere al menos dos puntos.")
+
+        # Crear la función de transferencia usando interpolación lineal
+        transfer_function = interp1d(sensor_readings, real_values, fill_value="extrapolate")
+        return transfer_function
+
+    def apply_transfer_function(self, data, transfer_function):
+        """
+        Aplica la función de transferencia a los datos de telemetría.
+        """
+        calibrated_data = {}
+        for ts, readings in data.items():
+            calibrated_readings = {}
+            for key, value in readings.items():
+                try:
+                    calibrated_readings[key] = transfer_function(float(value))
+                except ValueError:
+                    # Ignorar valores que no puedan ser convertidos
+                    calibrated_readings[key] = value
+            calibrated_data[ts] = calibrated_readings
+        return calibrated_data
+
+
+
+
 
 
 
