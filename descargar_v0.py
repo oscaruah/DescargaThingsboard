@@ -3,7 +3,7 @@ import json
 import os
 import csv
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytz  # Para manejo de zonas horarias
 from tqdm import tqdm
 import numpy as np
@@ -204,18 +204,29 @@ class ThingsBoardClient:
                     pass  # Leer hasta la última fila
                 if last_row:
                     try:
+                         # Limpiar el timestamp eliminando " UTC" si está presente
+                        timestamp_clean = last_row['timestamp'].strip().replace(" UTC", "")
+
+                        # Convertir a datetime en UTC
+                        last_timestamp_utc = datetime.strptime(timestamp_clean, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+
+                        return last_timestamp_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+     
                         # Convertir el último timestamp a datetime en UTC
-                        last_timestamp_utc = datetime.strptime(last_row['timestamp'], '%Y-%m-%d %H:%M:%S')
-                        last_timestamp_utc = last_timestamp_utc.replace(tzinfo=timezone.utc)
+                       # last_timestamp_utc = datetime.strptime(last_row['timestamp'], '%Y-%m-%d %H:%M:%S')
+                        #last_timestamp_utc = last_timestamp_utc.replace(tzinfo=timezone.utc)
 
                         # Convertir a la hora local
-                        local_tz = pytz.timezone('Europe/Madrid')  # Ajustar según la zona horaria deseada
-                        last_timestamp_local = last_timestamp_utc.astimezone(local_tz)
+                        #local_tz = pytz.timezone('Europe/Madrid')  # Ajustar según la zona horaria deseada
+                        #last_timestamp_local = last_timestamp_utc.astimezone(local_tz)
 
-                        return last_timestamp_local.strftime('%Y-%m-%d %H:%M:%S')
+                        #return last_timestamp_local.strftime('%Y-%m-%d %H:%M:%S')
                     except ValueError:
                         return "Error al leer el timestamp."
         return "Sin telemetría previa."
+
+
+
 
     def count_existing_records(self, csv_filename):
         """
@@ -232,11 +243,12 @@ class ThingsBoardClient:
                 record_count += sum(1 for key, value in row.items() if key != 'timestamp' and value)
         return record_count
 
+
     def download_telemetries(self):
-        tqdm.write("Descargando telemetría de dispositivos...")
+        tqdm.write("📥 Descargando telemetría de dispositivos...")
         customers = self.get_customers()
         if not customers:
-            tdqm.write(f"No se encontraron clientes con el nombre especificado: {self.customer_name}")
+            tqdm.write(f"❌ No se encontraron clientes con el nombre especificado: {self.customer_name}")
             return
 
         base_directory = 'thingsboard_data'
@@ -246,11 +258,11 @@ class ThingsBoardClient:
             customer_name = customer.get('title')
             customer_id = customer.get('id')
             customer_dir = os.path.join(base_directory, customer_name)
-            tqdm.write(f"Procesando cliente: {customer_name}")
+            tqdm.write(f"📊 Procesando cliente: {customer_name}")
 
             gateways = self.get_gateways_for_customer(customer_id)
             if not gateways:
-                tqdm.write(f"No se encontraron gateways para el cliente {customer_name}")
+                tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
                 continue
 
             for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
@@ -258,10 +270,11 @@ class ThingsBoardClient:
                 gateway_id = gateway.get('id').get('id')
                 gateway_dir = os.path.join(customer_dir, gateway_name)
 
-                devices = self.get_devices_for_gateway(gateway_id,customer_id)
+                devices = self.get_devices_for_gateway(gateway_id, customer_id)
                 if not devices:
-                    tqdm.write(f"No se encontraron dispositivos para el gateway {gateway_name}")
+                    tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
                     continue
+
                 for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
                     device_name = device.get('name')
                     device_id = device['id']['id']
@@ -270,33 +283,39 @@ class ThingsBoardClient:
                     device_dir = os.path.join(gateway_dir, device_name)
                     csv_filename = os.path.join(device_dir, f"{device_name}_telemetry.csv")
 
-                    # Contar registros ya existentes en el CSV
+                    # 📌 Obtener el timestamp más antiguo y más reciente de ThingsBoard
+                    start_ts, end_ts = self.get_time_range(device_name,device_id, keys)
+                    if not start_ts or not end_ts:
+                        tqdm.write(f"⚠️ No hay registros de telemetría en ThingsBoard para '{device_name}', omitiendo descarga.")
+                        continue
+                    start_ts_delete = start_ts
+                    end_ts_delete = end_ts
+                    #tqdm.write(f"🕒 Registro más antiguo en ThingsBoard para '{device_name}': {datetime.fromtimestamp(start_ts / 1000, tz=datetime.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                    #tqdm.write(f"🕒 Registro más reciente en ThingsBoard para '{device_name}': {datetime.fromtimestamp(end_ts / 1000, tz=datetime.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+
+                    # Contar registros ya existentes en el CSV local
                     existing_records = self.count_existing_records(csv_filename)
 
-                    # Mostrar la fecha y hora de la última telemetría almacenada
+                    # Mostrar la fecha y hora de la última telemetría almacenada en CSV
                     last_telemetry_time = self.get_last_telemetry_timestamp(csv_filename)
-                    tqdm.write(f"Última telemetría registrada para '{device_name}'-'{device_id}': {last_telemetry_time}")
+                    if last_telemetry_time and "UTC" in last_telemetry_time:
+                        last_telemetry_time = last_telemetry_time.replace(" UTC", "")  # 🛠️ Corrección aquí
 
-                    start_ts = int(datetime(2024, 9, 1).timestamp() * 1000)  # Fecha de inicio predeterminada
+                    tqdm.write(f"🕒 Última telemetría registrada en CSV para '{device_name}': {last_telemetry_time}")
+
+                    # Convertir la última telemetría registrada en CSV a timestamp en milisegundos
+                    try:
+                        last_ts = int(datetime.strptime(last_telemetry_time, '%Y-%m-%d %H:%M:%S').timestamp() * 1000)
+                    except ValueError:
+                        tqdm.write(f"⚠️ Error al procesar la última telemetría, usando fecha predeterminada.")
+                        last_ts = int(datetime(2024, 9, 1).timestamp() * 1000)  # Fecha de inicio predeterminada
+
+                    # Definir el rango de descarga de telemetrías
+                    start_ts = last_ts + 1  # Evitar duplicados
                     end_ts = int(datetime.now().timestamp() * 1000)  # Fecha actual como límite
 
-                    if os.path.exists(csv_filename):
-                        tqdm.write(f"Archivo de telemetría encontrado: {os.path.basename(csv_filename)}. Leyendo último timestamp.")
-                        with open(csv_filename, 'r') as csvfile:
-                            reader = csv.DictReader(csvfile)
-                            last_row = None
-                            for last_row in reader:
-                                pass
-                            if last_row:
-                                try:
-                                    last_ts = int(datetime.strptime(last_row['timestamp'], '%Y-%m-%d %H:%M:%S').timestamp() * 1000)
-                                    start_ts = last_ts + 1  # Evitar duplicados
-                                except ValueError:
-                                    tqdm.write(f"Error al leer el último timestamp. Usando fecha de inicio predeterminada.")
-                    else:
-                        tqdm.write(f"No se encontró archivo previo. Comenzando desde el 1 de septiembre de 2024.")
-
-                    limit = 50000
+                    limit = 10000  # Reducir el número de registros por solicitud
                     total_records = 0  # Para contar el número de registros (*timestamps * claves*)
 
                     all_data = {}
@@ -305,15 +324,15 @@ class ThingsBoardClient:
                         url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries?limit={limit}&startTs={start_ts}&endTs={end_ts}&keys={','.join(keys)}"
 
                         try:
-                            response = requests.get(url, headers=self._get_headers(), timeout=30)
+                            response = requests.get(url, headers=self._get_headers(), timeout=60)
                             if response.status_code == 500:
-                                tqdm.write(f"Dispositivo sin telemetrias: {device_name}")
+                                tqdm.write(f"⚠️ Dispositivo sin telemetría: {device_name}")
                                 break
                             response.raise_for_status()
                             data = response.json()
 
                             if not data:
-                                tqdm.write(f"No se encontraron más datos para {device_name}.")
+                                tqdm.write(f"✅ No se encontraron más datos para {device_name}.")
                                 break
 
                             for key in data:
@@ -324,15 +343,11 @@ class ThingsBoardClient:
                                         all_data[ts] = {}
                                     all_data[ts][key] = value
 
-                            # Calcular el número de claves (telemetrías) por cada timestamp
-                            for ts in all_data.keys():
-                                total_records += len(all_data[ts])
-
                             last_ts = max(entry['ts'] for key in data for entry in data[key])
-                            start_ts = last_ts + 1
+                            start_ts = last_ts + 1  # Evitar duplicados
 
                         except requests.exceptions.RequestException as e:
-                            tqdm.write(f"Error al descargar telemetría para '{device_name}': {e}")
+                            tqdm.write(f"❌ Error al descargar telemetría para '{device_name}': {e}")
                             break
 
                     if all_data:
@@ -348,7 +363,8 @@ class ThingsBoardClient:
                                 writer.writeheader()
 
                             for ts in sorted(all_data.keys()):
-                                row = {'timestamp': datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}
+                                utc_time = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                                row = {'timestamp': utc_time.strftime('%Y-%m-%d %H:%M:%S UTC')}  # Manteniendo formato UTC
                                 for key in all_keys:
                                     row[key] = all_data[ts].get(key, '')
                                 writer.writerow(row)
@@ -356,26 +372,113 @@ class ThingsBoardClient:
                         total_records += existing_records  # Añadir los registros ya presentes
 
                         file_size = os.path.getsize(csv_filename) / 1024  # Tamaño en KB
-                        tqdm.write(f"Telemetría guardada en '{os.path.basename(csv_filename)}' con {total_records} registros (timestamps * claves).")
+                        tqdm.write(f"✅ Telemetría guardada en '{os.path.basename(csv_filename)}' con {total_records} registros.")
                         report.append({
                             'file': os.path.basename(csv_filename),
                             'records': total_records,
                             'size_kb': file_size
                         })
-
-                        # Llamar a la función para procesar y calibrar
+                         # Llamar a la función para procesar y calibrar
                         calibration_file = os.path.join(device_dir, 'calibracion.json')
                         self.process_and_calibrate_telemetry(csv_filename, calibration_file)
 
-                        tqdm.write(f"Borrar telemetrias de dispositivo '{device_id}'");
-                        self.delete_telemetry(device_id, start_ts=None, end_ts=end_ts)
+                        # 🗑️ Borrar telemetrías de ThingsBoard
+                        tqdm.write(f"🗑️ Borrar telemetrías de dispositivo '{device_name}'")
+                        self.delete_telemetry(device_name, device_id, start_ts=start_ts_delete, end_ts=end_ts_delete)
                     else:
-                        tqdm.write(f"No se encontró telemetría para '{device_name}' en el rango de fechas especificado.")
+                        tqdm.write(f"⚠️ No se encontró telemetría para '{device_name}' en el rango de fechas especificado.")
 
         # Mostrar el reporte final
-        tqdm.write("\nReporte final de archivos descargados:")
+        tqdm.write("\n📊 Reporte final de archivos descargados:")
         for entry in report:
-            tqdm.write(f"Archivo: {entry['file']}, Registros: {entry['records']}, Tamaño: {entry['size_kb']:.2f} KB")
+            tqdm.write(f"📁 Archivo: {entry['file']}, Registros: {entry['records']}, Tamaño: {entry['size_kb']:.2f} KB")
+
+
+    def get_time_range(self, device_name,device_id, keys):
+        """
+        Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas,
+        comenzando desde el 1 de octubre de 2024 y avanzando día a día hasta encontrar datos.
+
+        Muestra trazas detalladas de cada paso del proceso.
+        """
+        headers = self._get_headers()
+        start_date = datetime(2024, 10, 1, tzinfo=timezone.utc)  # Fecha inicial de búsqueda
+        end_date = datetime.now(tz=timezone.utc)  # Fecha actual como límite
+        current_date = start_date  # Inicialización del día a consultar
+        oldest_timestamp = None  # Timestamp más antiguo encontrado
+        newest_timestamp = None  # Timestamp más reciente encontrado
+
+        tqdm.write(f"📡 Iniciando búsqueda de telemetría para el dispositivo {device_name} desde {start_date.strftime('%Y-%m-%d')} hasta la fecha actual.")
+
+        # Barra de progreso para visualizar el proceso
+        with tqdm(total=(end_date - start_date).days, desc="📅 Explorando días ", unit="día") as pbar:
+            while current_date <= end_date:
+                next_date = current_date + timedelta(days=1)  # Avanzar un día
+                start_ts = int(current_date.timestamp() * 1000)  # Convertir a milisegundos
+                end_ts = int(next_date.timestamp() * 1000)
+
+                #tqdm.write(f"🔍 Consultando telemetría entre {current_date.strftime('%Y-%m-%d')} y {next_date.strftime('%Y-%m-%d')}...")
+
+                for key in keys:
+                    url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
+                    params = {
+                        'keys': key,
+                        'startTs': start_ts,
+                        'endTs': end_ts,
+                        'limit': 1,
+                        'orderBy': 'ASC'  # Buscar el primer registro disponible
+                    }
+
+                    try:
+                        response = requests.get(url, headers=headers, params=params, timeout=10)
+                        response.raise_for_status()
+                        data = response.json()
+
+                        if key in data and data[key]:  # Si hay datos para esta clave en este rango
+                            key_oldest_ts = data[key][0]['ts']
+                            tqdm.write(f"📍 Encontrado primer registro para '{key}': {datetime.fromtimestamp(key_oldest_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+                            if oldest_timestamp is None or key_oldest_ts < oldest_timestamp:
+                                oldest_timestamp = key_oldest_ts
+
+                           # Obtener el último registro disponible (descendente)
+                            params_end = {'keys': key, 'limit': 1, 'ascOrder': 'false'}
+                            response_end = requests.get(url, headers=headers, params=params_end, timeout=10)
+                            response_end.raise_for_status()
+                            data_end = response_end.json()
+
+                            if key in data_end and data_end[key]:
+                                key_newest_ts = data_end[key][0]['ts']
+                                if newest_timestamp is None or key_newest_ts > newest_timestamp:
+                                    newest_timestamp = key_newest_ts
+
+                        # Si encontramos datos, salimos del bucle de fechas
+                        if oldest_timestamp and newest_timestamp:
+                            break
+
+                    except requests.exceptions.RequestException as e:
+                        tqdm.write(f"⚠️ Error al consultar la clave '{key}' entre {current_date.strftime('%Y-%m-%d')} y {next_date.strftime('%Y-%m-%d')}: {e}")
+
+                if oldest_timestamp and newest_timestamp:
+                    tqdm.write("✅ Datos encontrados, deteniendo la búsqueda.")
+                    break  # Detenemos la búsqueda si hemos encontrado datos
+
+                current_date = next_date  # Avanzamos al siguiente día
+                pbar.update(1)  # Actualizamos la barra de progreso
+
+        if oldest_timestamp is None or newest_timestamp is None:
+            tqdm.write(f"❌ No se encontraron datos de telemetría para {device_id} desde el 1 de octubre de 2024.")
+            return None, None
+
+        # Convertir timestamps a formato legible en UTC
+        oldest_readable = datetime.fromtimestamp(oldest_timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        newest_readable = datetime.fromtimestamp(newest_timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        tqdm.write(f"📍 Primer registro disponible:  {oldest_readable}")
+        tqdm.write(f"📍 Último registro disponible:  {newest_readable}")
+
+        return oldest_timestamp, newest_timestamp
+
 
 
     def generate_user_device_tree(self, output_file="user_device_tree.json"):
@@ -415,58 +518,102 @@ class ThingsBoardClient:
             json.dump(tree, json_file, indent=4)
         tqdm.write(f"Árbol de usuarios y dispositivos guardado en '{output_file}'")
 
-    def delete_telemetry(self, device_id, start_ts=None, end_ts=None):
+   
+
+    def delete_telemetry(self, device_name, device_id, start_ts=None, end_ts=None):
         """
-        Elimina telemetrías de un dispositivo entre un rango de fechas.
-        Si no se especifican fechas, se obtienen automáticamente del servidor.
+        Elimina telemetrías de un dispositivo en un rango de fechas. 
+        Si falla con el rango inicial, se reduce hasta llegar a 1 día.
+        Si falla con 1 día, se hace eliminación clave por clave.
         """
-        # Obtener todas las claves de telemetría del dispositivo
+        # Obtener todas las claves de telemetría
         keys = self.get_telemetry_keys(device_id)
         if not keys:
-            tqdm.write(f"No se encontraron claves de telemetría para el dispositivo {device_id}. No se puede eliminar.")
+            tqdm.write(f"❌ No se encontraron claves de telemetría para {device_name}. No se puede eliminar.")
             return
 
         # Obtener rango de tiempo si no se proporciona
-        if not start_ts or not end_ts:
+        if start_ts is None or end_ts is None:
             calculated_start_ts, calculated_end_ts = self.get_time_range(device_id, keys)
             start_ts = start_ts or calculated_start_ts
             end_ts = end_ts or calculated_end_ts
 
-        # Validar que se hayan obtenido valores válidos
-        if not start_ts or not end_ts:
-            tqdm.write(f"No se pudo determinar un rango de tiempo para eliminar datos del dispositivo {device_id}.")
+        # Validar rangos de tiempo
+        if start_ts is None or end_ts is None:
+            tqdm.write(f"❌ No se pudo determinar un rango de tiempo para eliminar datos de {device_name}.")
             return
 
-        url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/delete"
-        headers = self._get_headers()
+        if start_ts >= end_ts:
+            tqdm.write(f"🚨 ERROR: start_ts ({start_ts}) es mayor o igual que end_ts ({end_ts}). No se eliminarán telemetrías.")
+            return
 
-        # Parámetros de la solicitud
-        params = {
-            'keys': ','.join(keys),  # Claves de telemetría separadas por comas
-            'startTs': start_ts,
-            'endTs': end_ts
-        }
+        # Rango de eliminación progresiva
+        delete_windows = [30, 15, 7, 3, 1]  # Días
+        min_window_reached = False  # Flag para detectar cuando llegamos a 1 día
+        current_window = delete_windows[0]
 
-        try:
-            if start_ts is not None:
-                start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        # Convertir timestamps a formato UTC legible
+        start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        tqdm.write(f"🗑️ Iniciando borrado de telemetrías para '{device_name}' entre {start_readable} y {end_readable}")
+
+        while current_window > 0:
+            # Intentar borrar todas las claves con el rango actual
+            window_end_ts = start_ts + (current_window * 24 * 60 * 60 * 1000)  # Convertir días a ms
+            if window_end_ts > end_ts:
+                window_end_ts = end_ts  # Ajustar si excede el rango disponible
+
+            tqdm.write(f"🔹 Intentando borrar datos entre {datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(window_end_ts / 1000, tz=timezone.utc)} ({current_window} días)")
+
+            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/delete"
+            headers = self._get_headers()
+
+            try:
+                response = requests.delete(url, headers=headers, params={'keys': ','.join(keys), 'startTs': start_ts, 'endTs': window_end_ts})
+                if response.status_code == 200:
+                    tqdm.write(f"✅ Borrado exitoso de telemetrías entre {start_readable} y {end_readable}.")
+                    start_ts = window_end_ts + 1  # Avanzar al siguiente bloque de tiempo
+                    if start_ts >= end_ts:
+                        break  # Fin del proceso de eliminación
+                    continue  # Repetir el proceso con el siguiente bloque
+                else:
+                    tqdm.write(f"⚠️ Error en la eliminación: {response.status_code} - {response.text}")
+
+            except requests.exceptions.RequestException as e:
+                tqdm.write(f"⚠️ Error en la solicitud de eliminación: {e}")
+
+            # Si falló, reducir la ventana de tiempo
+            delete_windows.pop(0)
+            if delete_windows:
+                current_window = delete_windows[0]  # Pasar al siguiente rango menor
             else:
-                start_readable = "N/A"
+                min_window_reached = True
+                break  # Salir del bucle
 
-            if end_ts is not None:
-                end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            else:
-                end_readable = "N/A"
- 
-            tqdm.write(f"Eliminando telemetrías para el dispositivo {device_id} entre {start_readable} y {end_readable} con claves: {keys}...")
+        # Si llegamos a la ventana mínima (1 día) sin éxito, intentar clave por clave
+        if min_window_reached:
+            tqdm.write(f"🔻 No se pudo eliminar con el rango mínimo. Intentando eliminación clave por clave...")
+            for key in tqdm(keys, desc="Borrando claves", unit="claves"):
+                key_start_ts = start_ts  # Reiniciar para cada clave
+                while key_start_ts < end_ts:
+                    key_end_ts = key_start_ts + (1 * 24 * 60 * 60 * 1000)  # 1 día en ms
+                    if key_end_ts > end_ts:
+                        key_end_ts = end_ts  # Ajustar límite
 
-            response = requests.delete(url, headers=headers, params=params)
-            if response.status_code == 200:
-                tqdm.write(f"Telemetrías eliminadas para el dispositivo {device_id}.")
-            else:
-                tqdm.write(f"Error al eliminar telemetrías: {response.status_code} - {response.text}")
-        except requests.exceptions.RequestException as e:
-            tqdm.write(f"Error en la solicitud de eliminación para {device_id}: {e}")
+                    tqdm.write(f"🔹 Intentando borrar '{key}' entre {datetime.fromtimestamp(key_start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(key_end_ts / 1000, tz=timezone.utc)}")
+
+                    try:
+                        response = requests.delete(url, headers=headers, params={'keys': key, 'startTs': key_start_ts, 'endTs': key_end_ts})
+                        if response.status_code == 200:
+                            tqdm.write(f"✅ Borrado exitoso de '{key}' entre {datetime.fromtimestamp(key_start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(key_end_ts / 1000, tz=timezone.utc)}")
+                        else:
+                            tqdm.write(f"⚠️ Error al borrar '{key}': {response.status_code} - {response.text}")
+                    except requests.exceptions.RequestException as e:
+                        tqdm.write(f"⚠️ Error en la solicitud de eliminación para '{key}': {e}")
+
+                    key_start_ts = key_end_ts + 1  # Avanzar al siguiente bloque de tiempo
+
+        tqdm.write(f"🗑️ Proceso de eliminación de telemetrías finalizado para '{device_name}'.")
 
 
     def get_time_range_fijo(self, device_id, keys):
@@ -482,133 +629,40 @@ class ThingsBoardClient:
         for key in keys:
             url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
             headers = self._get_headers()
-            
+
             try:
                 # Parámetros para el último dato
                 params_end = {'keys': key, 'limit': 1, 'ascOrder': False}
-                response_end = requests.get(url, headers=headers, params=params_end)
+                response_end = requests.get(url, headers=headers, params=params_end, timeout=10)
                 response_end.raise_for_status()
-                data_end = response_end.json().get(key, [])
-                if data_end and 'ts' in data_end[0]:
-                    key_end_ts = data_end[0]['ts']
-                    end_ts = max(end_ts, key_end_ts) if end_ts else key_end_ts
+                json_end = response_end.json()
+
+                if key in json_end and json_end[key]:
+                    key_end_ts = json_end[key][0].get('ts', None)
+                    if key_end_ts is not None:
+                        end_ts = max(end_ts, key_end_ts) if end_ts else key_end_ts
 
             except requests.exceptions.RequestException as e:
-                tqdm.write(f"Error al obtener el rango de tiempo para la clave {key}: {e}")
+                tqdm.write(f"⚠️ Error al obtener el rango de tiempo para la clave {key}: {e}")
+
+        # Si no se obtuvo `end_ts`, usar la fecha actual
+        if end_ts is None:
+            end_ts = int(datetime.now().timestamp() * 1000)
+            tqdm.write(f"⚠️ No se encontró `end_ts`, usando la fecha actual: {datetime.utcfromtimestamp(end_ts / 1000)}")
+
+        # 🚨 Evitar que `start_ts` sea mayor o igual que `end_ts`
+        if start_ts >= end_ts:
+            tqdm.write(f"⚠️ Corrigiendo: `start_ts` ({start_ts}) es mayor o igual que `end_ts` ({end_ts}). Ajustando `end_ts`.")
+            end_ts = start_ts + 1000  # Sumar 1 segundo
 
         # Convertir timestamps a formato legible
-        start_readable = datetime.fromtimestamp(fixed_start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        end_readable = (
-            datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') 
-            if end_ts else "N/A"
-        )
+        start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
         # Mostrar los rangos calculados
-        tqdm.write(f"Rango de tiempo calculado: Inicio fijo: {start_readable}, Fin: {end_readable}")
+        tqdm.write(f"📊 Rango de tiempo calculado para {device_id}: Inicio fijo: {start_readable}, Fin: {end_readable}")
 
         return start_ts, end_ts
-
-    def get_time_range(self, device_id, keys):
-        """
-        Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas
-        y los imprime en formato legible.
-        """
-        start_ts = None
-        end_ts = None
-
-        for key in keys:
-            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
-            headers = self._get_headers()
-        
-            try:
-                # Parámetros para el primer dato
-                params_start = {'keys': key, 'limit': 1, 'ascOrder': True}
-                response_start = requests.get(url, headers=headers, params=params_start)
-                response_start.raise_for_status()
-                data_start = response_start.json().get(key, [])
-                if data_start and 'ts' in data_start[0]:
-                    key_start_ts = data_start[0]['ts']
-                    start_ts = min(start_ts, key_start_ts) if start_ts else key_start_ts
-
-                # Parámetros para el último dato
-                params_end = {'keys': key, 'limit': 1, 'ascOrder': False}
-                response_end = requests.get(url, headers=headers, params=params_end)
-                response_end.raise_for_status()
-                data_end = response_end.json().get(key, [])
-                if data_end and 'ts' in data_end[0]:
-                    key_end_ts = data_end[0]['ts']
-                    end_ts = max(end_ts, key_end_ts) if end_ts else key_end_ts
-
-            except requests.exceptions.RequestException as e:
-                tqdm.write(f"Error al obtener el rango de tiempo para la clave {key}: {e}")
-
-        # Convertir timestamps a formato legible
-        start_readable = (
-            datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') 
-            if start_ts else "N/A"
-        )
-        end_readable = (
-            datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') 
-            if end_ts else "N/A"
-        )
-
-        # Mostrar los rangos calculados
-        tqdm.write(f"Rango de tiempo calculado: Inicio: {start_readable}, Fin: {end_readable}")
-
-        return start_ts, end_ts
-
-    def get_time_range_old_V(self, device_id, keys):
-        """
-        Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas
-        y los imprime en formato legible.
-        """
-        start_ts = None
-        end_ts = None
-
-        for key in keys:
-            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries?keys={key}&limit=1"
-            headers = self._get_headers()
-
-            try:
-                # Obtener el primer dato (más antiguo)
-                response_start = requests.get(url, headers=headers, params={'ascOrder': True})
-                response_start.raise_for_status()
-                data_start = response_start.json().get(key, [])
-                if data_start:
-                    key_start_ts = data_start[0]['ts']
-                    if start_ts is None or key_start_ts < start_ts:
-                        start_ts = key_start_ts
-
-                # Obtener el último dato (más reciente)
-                response_end = requests.get(url, headers=headers, params={'ascOrder': False})
-                response_end.raise_for_status()
-                data_end = response_end.json().get(key, [])
-                if data_end:
-                    key_end_ts = data_end[0]['ts']
-                    if end_ts is None or key_end_ts > end_ts:
-                        end_ts = key_end_ts
-
-            except requests.exceptions.RequestException as e:
-                tqdm.write(f"Error al obtener el rango de tiempo para la clave {key}: {e}")
-
-        # Convertir timestamps a formato legible
-        if start_ts is not None:
-            start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        else:
-            start_readable = "N/A"
-
-        if end_ts is not None:
-            end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        else:
-            end_readable = "N/A"
-
-        # Mostrar los rangos calculados
-        tqdm.write(f"Rango de tiempo calculado: Inicio: {start_readable}, Fin: {end_readable}")
-
-        return start_ts, end_ts
-
-
-
 
     def process_and_calibrate_telemetry(self, csv_filename, calibration_file=None):
         """
@@ -739,11 +793,6 @@ class ThingsBoardClient:
                     calibrated_readings[key] = value
             calibrated_data[ts] = calibrated_readings
         return calibrated_data
-
-
-
-
-
 
 
 if __name__ == "__main__":
