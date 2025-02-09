@@ -8,6 +8,7 @@ import pytz  # Para manejo de zonas horarias
 from tqdm import tqdm
 import numpy as np
 from scipy.interpolate import interp1d
+import glob
 
 
 class ThingsBoardClient:
@@ -402,7 +403,8 @@ class ThingsBoardClient:
         Muestra trazas detalladas de cada paso del proceso.
         """
         headers = self._get_headers()
-        start_date = datetime(2024, 10, 1, tzinfo=timezone.utc)  # Fecha inicial de búsqueda
+       #start_date = datetime(2024, 10, 1, tzinfo=timezone.utc)  # Fecha inicial de búsqueda
+        start_date = datetime.now(tz=timezone.utc) - timedelta(days=30)  
         end_date = datetime.now(tz=timezone.utc)  # Fecha actual como límite
         current_date = start_date  # Inicialización del día a consultar
         oldest_timestamp = None  # Timestamp más antiguo encontrado
@@ -518,102 +520,121 @@ class ThingsBoardClient:
             json.dump(tree, json_file, indent=4)
         tqdm.write(f"Árbol de usuarios y dispositivos guardado en '{output_file}'")
 
-   
-
-    def delete_telemetry(self, device_name, device_id, start_ts=None, end_ts=None):
+    def download_telemetries(self):
         """
-        Elimina telemetrías de un dispositivo en un rango de fechas. 
-        Si falla con el rango inicial, se reduce hasta llegar a 1 día.
-        Si falla con 1 día, se hace eliminación clave por clave.
+        Descarga la telemetría de los dispositivos y fragmenta los archivos CSV en partes de máximo 10 MB.
+        Luego, se aplica la calibración a cada fragmento.
         """
-        # Obtener todas las claves de telemetría
-        keys = self.get_telemetry_keys(device_id)
-        if not keys:
-            tqdm.write(f"❌ No se encontraron claves de telemetría para {device_name}. No se puede eliminar.")
+        tqdm.write("\U0001F4E5 Descargando telemetría de dispositivos...")
+        customers = self.get_customers()
+        if not customers:
+            tqdm.write(f"\u274C No se encontraron clientes con el nombre especificado: {self.customer_name}")
             return
 
-        # Obtener rango de tiempo si no se proporciona
-        if start_ts is None or end_ts is None:
-            calculated_start_ts, calculated_end_ts = self.get_time_range(device_id, keys)
-            start_ts = start_ts or calculated_start_ts
-            end_ts = end_ts or calculated_end_ts
+        base_directory = 'thingsboard_data'
+        max_file_size = 10 * 1024 * 1024  # 10 MB en bytes
 
-        # Validar rangos de tiempo
-        if start_ts is None or end_ts is None:
-            tqdm.write(f"❌ No se pudo determinar un rango de tiempo para eliminar datos de {device_name}.")
-            return
+        for customer in tqdm(customers, desc="Clientes"):
+            customer_name = customer.get('title')
+            customer_id = customer.get('id')
+            customer_dir = os.path.join(base_directory, customer_name)
+            tqdm.write(f"\U0001F4CA Procesando cliente: {customer_name}")
 
-        if start_ts >= end_ts:
-            tqdm.write(f"🚨 ERROR: start_ts ({start_ts}) es mayor o igual que end_ts ({end_ts}). No se eliminarán telemetrías.")
-            return
+            gateways = self.get_gateways_for_customer(customer_id)
+            if not gateways:
+                tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
+                continue
 
-        # Rango de eliminación progresiva
-        delete_windows = [30, 15, 7, 3, 1]  # Días
-        min_window_reached = False  # Flag para detectar cuando llegamos a 1 día
-        current_window = delete_windows[0]
+            for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
+                gateway_name = gateway.get('name')
+                gateway_id = gateway.get('id').get('id')
+                gateway_dir = os.path.join(customer_dir, gateway_name)
 
-        # Convertir timestamps a formato UTC legible
-        start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        tqdm.write(f"🗑️ Iniciando borrado de telemetrías para '{device_name}' entre {start_readable} y {end_readable}")
+                devices = self.get_devices_for_gateway(gateway_id, customer_id)
+                if not devices:
+                    tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
+                    continue
 
-        while current_window > 0:
-            # Intentar borrar todas las claves con el rango actual
-            window_end_ts = start_ts + (current_window * 24 * 60 * 60 * 1000)  # Convertir días a ms
-            if window_end_ts > end_ts:
-                window_end_ts = end_ts  # Ajustar si excede el rango disponible
+                for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
+                    device_name = device.get('name')
+                    device_id = device['id']['id']
+                    keys = self.get_telemetry_keys(device_id)
 
-            tqdm.write(f"🔹 Intentando borrar datos entre {datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(window_end_ts / 1000, tz=timezone.utc)} ({current_window} días)")
+                    device_dir = os.path.join(gateway_dir, device_name)
+                    os.makedirs(device_dir, exist_ok=True)
 
-            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/delete"
-            headers = self._get_headers()
+                    # Obtener el timestamp más antiguo y más reciente de ThingsBoard
+                    start_ts, end_ts = self.get_time_range(device_name, device_id, keys)
+                    if not start_ts or not end_ts:
+                        tqdm.write(f"⚠️ No hay registros de telemetría en ThingsBoard para '{device_name}', omitiendo descarga.")
+                        continue
 
-            try:
-                response = requests.delete(url, headers=headers, params={'keys': ','.join(keys), 'startTs': start_ts, 'endTs': window_end_ts})
-                if response.status_code == 200:
-                    tqdm.write(f"✅ Borrado exitoso de telemetrías entre {start_readable} y {end_readable}.")
-                    start_ts = window_end_ts + 1  # Avanzar al siguiente bloque de tiempo
-                    if start_ts >= end_ts:
-                        break  # Fin del proceso de eliminación
-                    continue  # Repetir el proceso con el siguiente bloque
-                else:
-                    tqdm.write(f"⚠️ Error en la eliminación: {response.status_code} - {response.text}")
+                    start_ts_download = start_ts
+                    limit = 10000
+                    file_part = 1  # Controlar los fragmentos de archivo
+                    all_data = {}
+                    current_file = os.path.join(device_dir, f"{device_name}_telemetry_part{file_part}.csv")
 
-            except requests.exceptions.RequestException as e:
-                tqdm.write(f"⚠️ Error en la solicitud de eliminación: {e}")
+                    while start_ts_download <= end_ts:
+                        url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries?limit={limit}&startTs={start_ts_download}&endTs={end_ts}&keys={','.join(keys)}"
 
-            # Si falló, reducir la ventana de tiempo
-            delete_windows.pop(0)
-            if delete_windows:
-                current_window = delete_windows[0]  # Pasar al siguiente rango menor
-            else:
-                min_window_reached = True
-                break  # Salir del bucle
+                        try:
+                            response = requests.get(url, headers=self._get_headers(), timeout=60)
+                            response.raise_for_status()
+                            data = response.json()
 
-        # Si llegamos a la ventana mínima (1 día) sin éxito, intentar clave por clave
-        if min_window_reached:
-            tqdm.write(f"🔻 No se pudo eliminar con el rango mínimo. Intentando eliminación clave por clave...")
-            for key in tqdm(keys, desc="Borrando claves", unit="claves"):
-                key_start_ts = start_ts  # Reiniciar para cada clave
-                while key_start_ts < end_ts:
-                    key_end_ts = key_start_ts + (1 * 24 * 60 * 60 * 1000)  # 1 día en ms
-                    if key_end_ts > end_ts:
-                        key_end_ts = end_ts  # Ajustar límite
+                            if not data:
+                                tqdm.write(f"✅ No se encontraron más datos para {device_name}.")
+                                break
 
-                    tqdm.write(f"🔹 Intentando borrar '{key}' entre {datetime.fromtimestamp(key_start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(key_end_ts / 1000, tz=timezone.utc)}")
+                            for key in data:
+                                for entry in data[key]:
+                                    ts = entry['ts']
+                                    value = entry['value']
+                                    if ts not in all_data:
+                                        all_data[ts] = {}
+                                    all_data[ts][key] = value
 
-                    try:
-                        response = requests.delete(url, headers=headers, params={'keys': key, 'startTs': key_start_ts, 'endTs': key_end_ts})
-                        if response.status_code == 200:
-                            tqdm.write(f"✅ Borrado exitoso de '{key}' entre {datetime.fromtimestamp(key_start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(key_end_ts / 1000, tz=timezone.utc)}")
-                        else:
-                            tqdm.write(f"⚠️ Error al borrar '{key}': {response.status_code} - {response.text}")
-                    except requests.exceptions.RequestException as e:
-                        tqdm.write(f"⚠️ Error en la solicitud de eliminación para '{key}': {e}")
+                            last_ts = max(entry['ts'] for key in data for entry in data[key])
+                            start_ts_download = last_ts + 1  # Avanzar al siguiente lote
 
-                    key_start_ts = key_end_ts + 1  # Avanzar al siguiente bloque de tiempo
+                        except requests.exceptions.RequestException as e:
+                            tqdm.write(f"❌ Error al descargar telemetría para '{device_name}': {e}")
+                            break
 
-        tqdm.write(f"🗑️ Proceso de eliminación de telemetrías finalizado para '{device_name}'.")
+                        # Si hay datos, escribir en el archivo CSV con fragmentación
+                        if all_data:
+                            all_keys = sorted(keys)
+                            fieldnames = ['timestamp'] + all_keys
+
+                            while True:
+                                with open(current_file, 'a', newline='') as csvfile:
+                                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                                    if os.stat(current_file).st_size == 0:
+                                        writer.writeheader()
+
+                                    for ts in sorted(all_data.keys()):
+                                        row = {'timestamp': datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+                                        for key in all_keys:
+                                            row[key] = all_data[ts].get(key, '')
+                                        writer.writerow(row)
+
+                                # Si el archivo supera el tamaño máximo, abrir uno nuevo
+                                if os.path.getsize(current_file) > max_file_size:
+                                    file_part += 1
+                                    current_file = os.path.join(device_dir, f"{device_name}_telemetry_part{file_part}.csv")
+                                else:
+                                    break  # Salir del bucle si el tamaño es adecuado
+
+                    tqdm.write(f"✅ Telemetría guardada en fragmentos de 10 MB para '{device_name}' en {device_dir}.")
+
+                    # 📌 **Aplicar calibración a cada archivo generado**
+                    for part_num in range(1, file_part + 1):
+                        file_path = os.path.join(device_dir, f"{device_name}_telemetry_part{part_num}.csv")
+                        if os.path.exists(file_path):
+                            calibration_file = os.path.join(device_dir, "calibracion.json")  # Ruta del archivo de calibración
+                            self.process_and_calibrate_telemetry(file_path, calibration_file)
 
 
     def get_time_range_fijo(self, device_id, keys):
@@ -664,99 +685,109 @@ class ThingsBoardClient:
 
         return start_ts, end_ts
 
+   
+
     def process_and_calibrate_telemetry(self, csv_filename, calibration_file=None):
         """
-        Procesa el archivo de telemetría y crea un nuevo archivo terminado en `_cal`, recalibrando 
-        toda la tabla si el archivo de calibración ha cambiado.
+        Procesa el archivo de telemetría y crea nuevos archivos terminados en `_cal`,
+        recalibrando toda la tabla si el archivo de calibración ha cambiado.
+
+        Si hay varios archivos particionados, aplica la calibración a todos.
         """
-        if not os.path.exists(csv_filename):
-            tqdm.write(f"Archivo de telemetría no encontrado: {csv_filename}")
-            return
+        # Detectar archivos particionados si existen
+        base_name, ext = os.path.splitext(csv_filename)
+        partitioned_files = sorted(glob.glob(f"{base_name}_part*.csv"))  # Buscar archivos tipo *_part1.csv
 
-        # Generar nombre del archivo calibrado
-      #  base, ext = os.path.splitext(csv_filename)
-      #  calibrated_csv_filename = f"{base}_cal{ext}"
+        if partitioned_files:
+            tqdm.write(f"📂 Se encontraron {len(partitioned_files)} archivos particionados. Aplicando calibración a cada uno...")
+        else:
+            partitioned_files = [csv_filename]  # Si no hay particionados, trabajar con el original
 
-        # Verificar si se debe recalibrar
+        # Verificar si la calibración debe aplicarse
         recalibrate_all = False
         if calibration_file and os.path.exists(calibration_file):
             try:
                 calib_mtime = os.path.getmtime(calibration_file)  # Última modificación del archivo de calibración
-                csv_mtime = os.path.getmtime(csv_filename) 
-
-                # Si el archivo de calibración es más reciente, recalibramos
+                csv_mtime = max(os.path.getmtime(file) for file in partitioned_files)  # Última modificación de cualquier CSV
+                
+                # Si el archivo de calibración es más reciente, recalibramos todos los archivos
                 if calib_mtime > csv_mtime:
-                    tqdm.write(f"Archivo de calibración más reciente encontrado. Recalibrando toda la tabla...")
+                    tqdm.write(f"📌 Archivo de calibración más reciente encontrado. Recalibrando todos los archivos...")
                     recalibrate_all = True
             except Exception as e:
-                tqdm.write(f"Error al verificar el archivo de calibración: {e}")
+                tqdm.write(f"⚠️ Error al verificar el archivo de calibración: {e}")
                 return
         else:
-            tqdm.write("Archivo de calibración no encontrado. No se aplicarán ajustes.")
+            tqdm.write("⚠️ Archivo de calibración no encontrado. No se aplicarán ajustes.")
 
-        # Leer el archivo CSV original
-        with open(csv_filename, 'r') as csvfile:
-            reader = csv.DictReader(csvfile)
-            rows = list(reader)  # Leer todas las filas
-            fieldnames = reader.fieldnames + ['current_cal', 'power_cal']
-            fieldnames = list(dict.fromkeys(fieldnames))  # Evitar duplicados
-
-
-        # Generar función de transferencia si hay un archivo de calibración
+        # Generar la función de transferencia si hay un archivo de calibración
         transfer_function = None
         if calibration_file and os.path.exists(calibration_file):
             try:
                 transfer_function = self.generate_transfer_function(calibration_file)
             except Exception as e:
-                tqdm.write(f"Error al procesar el archivo de calibración: {e}")
+                tqdm.write(f"⚠️ Error al procesar el archivo de calibración: {e}")
                 return
 
-        # Procesar las filas y añadir las columnas calculadas
-        processed_rows = []
-        for row in rows:
-            try:
-                current = float(row.get('current', 0) or 0)
-                voltage = float(row.get('voltage', 0) or 0)
-            except ValueError:
-                current = 0
-                voltage = 0
+        # Procesar cada archivo (original o particionado)
+        for file in partitioned_files:
+            tqdm.write(f"📄 Procesando archivo: {file}")
 
-            # Verificar si la fila ya está calibrada
-            is_calibrated = (
-                 'current_cal' in row and 'power_cal' in row 
-                  and row['current_cal'] != '' and row['power_cal'] != ''
-            )
+            # Leer el archivo CSV original
+            with open(file, 'r') as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)  # Leer todas las filas
+                fieldnames = reader.fieldnames + ['current_cal', 'power_cal']
+                fieldnames = list(dict.fromkeys(fieldnames))  # Evitar duplicados
 
-            current_cal = None
-            power_cal = None
-
-            # Calcular `current_cal` y `power_cal` si hay función de transferencia
-            if transfer_function and (recalibrate_all or not is_calibrated):
+            # Procesar las filas y añadir las columnas calculadas
+            processed_rows = []
+            for row in rows:
                 try:
-                    if current > 0:
-                        current_cal = float(transfer_function(current))
-                        current_cal = round(current_cal,2)
-                        power_cal = round (voltage * current_cal,2)
-                    else:
-                        current_cal = 0
-                        power_cal = 0
-
+                    current = float(row.get('current', 0) or 0)
+                    voltage = float(row.get('voltage', 0) or 0)
                 except ValueError:
-                    current_cal = None
-                    power_cal = None
+                    current = 0
+                    voltage = 0
 
-            # Asignar las columnas calculadas
-            row['current_cal'] = current_cal if current_cal is not None else row.get('current_cal', '')
-            row['power_cal'] = power_cal if power_cal is not None else row.get('power_cal', '')
-            processed_rows.append(row)
+                # Verificar si la fila ya está calibrada
+                is_calibrated = (
+                    'current_cal' in row and 'power_cal' in row 
+                    and row['current_cal'] != '' and row['power_cal'] != ''
+                )
 
-        # Escribir el archivo actualizado con las nuevas columnas
-        with open(csv_filename, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(processed_rows)
+                current_cal = None
+                power_cal = None
 
-        tqdm.write(f"Archivo calibrado y guardado en: {csv_filename}")
+                # Calcular `current_cal` y `power_cal` si hay función de transferencia
+                if transfer_function and (recalibrate_all or not is_calibrated):
+                    try:
+                        if current > 0:
+                            current_cal = round(float(transfer_function(current)), 2)
+                            power_cal = round(voltage * current_cal, 2)
+                        else:
+                            current_cal = 0
+                            power_cal = 0
+                    except ValueError:
+                        current_cal = None
+                        power_cal = None
+
+                # Asignar las columnas calculadas
+                row['current_cal'] = current_cal if current_cal is not None else row.get('current_cal', '')
+                row['power_cal'] = power_cal if power_cal is not None else row.get('power_cal', '')
+                processed_rows.append(row)
+
+            # Generar nombre del archivo calibrado
+            calibrated_filename = file.replace(".csv", "_cal.csv")
+
+            # Escribir el archivo calibrado
+            with open(calibrated_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(processed_rows)
+
+            tqdm.write(f"✅ Archivo calibrado y guardado en: {calibrated_filename}")
+
 
 
     def generate_transfer_function(self,calibration_file):
@@ -794,10 +825,201 @@ class ThingsBoardClient:
             calibrated_data[ts] = calibrated_readings
         return calibrated_data
 
+    def calibrate_telemetries(self):
+        """
+        Aplica la calibración a todos los archivos de telemetría en todos los clientes.
+        Si no existe un archivo de calibración, se genera copiando 'current' y 'power'.
+        """
+        tqdm.write("📏 Aplicando calibración a archivos de telemetría...")
+        customers = self.get_customers()
+        if not customers:
+            tqdm.write("❌ No se encontraron clientes para aplicar calibración.")
+            return
 
+        base_directory = 'thingsboard_data'
+        for customer in tqdm(customers, desc="Clientes"):
+            customer_name = customer.get('title')
+            customer_dir = os.path.join(base_directory, customer_name)
+            tqdm.write(f"📊 Procesando cliente: {customer_name}")
+
+            gateways = self.get_gateways_for_customer(customer.get('id'))
+            if not gateways:
+                tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
+                continue
+
+            for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
+                gateway_name = gateway.get('name')
+                gateway_dir = os.path.join(customer_dir, gateway_name)
+
+                devices = self.get_devices_for_gateway(gateway.get('id').get('id'), customer.get('id'))
+                if not devices:
+                    tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
+                    continue
+
+                for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
+                    device_name = device.get('name')
+                    device_dir = os.path.join(gateway_dir, device_name)
+
+                    if not os.path.exists(device_dir):
+                        continue
+
+                    # Buscar archivos de telemetría
+                    telemetry_files = sorted(glob.glob(f"{device_dir}/{device_name}_telemetry*.csv"))
+                    if not telemetry_files:
+                        tqdm.write(f"⚠️ No se encontraron archivos de telemetría para '{device_name}'.")
+                        continue
+
+                    # Archivo de calibración
+                    calibration_file = os.path.join(device_dir, "calibracion.json")
+
+                    # Aplicar calibración a cada archivo
+                    for file in telemetry_files:
+                        self.process_and_calibrate_telemetry(file, calibration_file)
+    
+    def process_and_calibrate_telemetry(self, csv_filename, calibration_file=None):
+            """
+            Aplica la calibración a un archivo de telemetría o crea la calibración si no existe.
+            """
+            if not os.path.exists(csv_filename):
+                tqdm.write(f"Archivo de telemetría no encontrado: {csv_filename}")
+                return
+
+            # Verificar si se debe recalibrar
+            recalibrate_all = False
+            if calibration_file and os.path.exists(calibration_file):
+                try:
+                    calib_mtime = os.path.getmtime(calibration_file)
+                    csv_mtime = os.path.getmtime(csv_filename)
+                    if calib_mtime > csv_mtime:
+                        tqdm.write(f"Archivo de calibración más reciente encontrado. Recalibrando {csv_filename}...")
+                        recalibrate_all = True
+                except Exception as e:
+                    tqdm.write(f"Error al verificar el archivo de calibración: {e}")
+                    return
+            else:
+                tqdm.write(f"⚠️ Archivo de calibración no encontrado. Creando uno con los datos existentes...")
+                self.create_default_calibration(csv_filename, calibration_file)
+                return
+
+            # Leer archivo CSV
+            with open(csv_filename, 'r') as csvfile:
+                reader = csv.DictReader(csvfile)
+                rows = list(reader)
+                fieldnames = reader.fieldnames + ['current_cal', 'power_cal']
+                fieldnames = list(dict.fromkeys(fieldnames))
+
+            # Generar función de transferencia
+            transfer_function = self.generate_transfer_function(calibration_file) if calibration_file else None
+
+            # Aplicar calibración
+            processed_rows = []
+            for row in rows:
+                current = float(row.get('current', 0) or 0)
+                voltage = float(row.get('voltage', 0) or 0)
+                current_cal = None
+                power_cal = None
+
+                if transfer_function and (recalibrate_all or 'current_cal' not in row or 'power_cal' not in row):
+                    try:
+                        current_cal = round(float(transfer_function(current)), 2) if current > 0 else 0
+                        power_cal = round(voltage * current_cal, 2)
+                    except ValueError:
+                        current_cal = None
+                        power_cal = None
+
+                row['current_cal'] = current_cal if current_cal is not None else row.get('current_cal', '')
+                row['power_cal'] = power_cal if power_cal is not None else row.get('power_cal', '')
+                processed_rows.append(row)
+
+            # Guardar archivo calibrado
+            calibrated_filename = csv_filename.replace(".csv", "_cal.csv")
+            with open(calibrated_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(processed_rows)
+
+            tqdm.write(f"✅ Archivo calibrado y guardado en: {calibrated_filename}")
+
+    def create_default_calibration(self, csv_filename, calibration_file):
+        """
+        Crea un archivo de calibración con la estructura correcta usando valores fijos de corriente.
+        """
+        calibration_data = {
+            "unidad_medida": "Amperios",
+            "descripcion": "Tabla de Calibración",
+            "fecha_calibracion": datetime.now().strftime("%Y-%m-%d"),
+            "tecnico_responsable": "Desconocido",
+            "puntos_calibracion": [
+                {"corriente_real": 1, "lectura_sensor": 1},
+                {"corriente_real": 2, "lectura_sensor": 2},
+                {"corriente_real": 3, "lectura_sensor": 3},
+                {"corriente_real": 4, "lectura_sensor": 4}
+            ]
+        }
+
+        with open(calibration_file, 'w') as f:
+            json.dump(calibration_data, f, indent=4)
+
+        tqdm.write(f"✅ Archivo de calibración creado: {calibration_file}")
+
+
+    def remove_calibrated_files(self):
+        """
+        Elimina todos los archivos de telemetría calibrados (_cal.csv) en todos los clientes.
+        """
+        tqdm.write("🗑️ Eliminando archivos de calibración (_cal.csv)...")
+        customers = self.get_customers()
+        if not customers:
+            tqdm.write("❌ No se encontraron clientes para eliminar calibraciones.")
+            return
+
+        base_directory = 'thingsboard_data'
+        for customer in tqdm(customers, desc="Clientes"):
+            customer_name = customer.get('title')
+            customer_dir = os.path.join(base_directory, customer_name)
+            tqdm.write(f"📊 Procesando cliente: {customer_name}")
+
+            gateways = self.get_gateways_for_customer(customer.get('id'))
+            if not gateways:
+                tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
+                continue
+
+            for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
+                gateway_name = gateway.get('name')
+                gateway_dir = os.path.join(customer_dir, gateway_name)
+
+                devices = self.get_devices_for_gateway(gateway.get('id').get('id'), customer.get('id'))
+                if not devices:
+                    tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
+                    continue
+
+                for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
+                    device_name = device.get('name')
+                    device_dir = os.path.join(gateway_dir, device_name)
+
+                    if not os.path.exists(device_dir):
+                        continue
+
+                    # Buscar archivos de telemetría calibrados
+                    cal_files = sorted(glob.glob(f"{device_dir}/{device_name}_telemetry*_cal.csv"))
+                    if not cal_files:
+                        tqdm.write(f"⚠️ No se encontraron archivos calibrados para '{device_name}'.")
+                        continue
+
+                    # Eliminar archivos calibrados
+                    for file in cal_files:
+                        try:
+                            os.remove(file)
+                            tqdm.write(f"🗑️ Eliminado: {file}")
+                        except Exception as e:
+                            tqdm.write(f"❌ Error al eliminar {file}: {e}")
+
+        tqdm.write("✅ Proceso de eliminación de archivos de calibración finalizado.")
+
+   
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ThingsBoard Data Organizer')
-    parser.add_argument('command', choices=['organize', 'download','tree'], help='Command to execute')
+    parser.add_argument('command', choices=['organize', 'download','tree','calibracion','uncal'], help='Command to execute')
     parser.add_argument('--customer', type=str, help='Nombre del cliente para filtrar')
 
     args = parser.parse_args()
@@ -810,3 +1032,7 @@ if __name__ == "__main__":
         client.download_telemetries()
     elif args.command == 'tree':
         client.generate_user_device_tree()
+    elif args.command == 'calibracion':
+        client.calibrate_telemetries()
+    elif args.command == 'uncal':
+        client.remove_calibrated_files()
