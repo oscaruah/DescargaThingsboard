@@ -1,3 +1,4 @@
+import smtplib
 import requests
 import json
 import os
@@ -9,7 +10,7 @@ from tqdm import tqdm
 import numpy as np
 from scipy.interpolate import interp1d
 import glob
-
+from email.message import EmailMessage
 
 class ThingsBoardClient:
     def __init__(self, config_file='config.json', token_file='token.json',customer_name=None):
@@ -35,6 +36,7 @@ class ThingsBoardClient:
         self.customer_name = customer_name #numero parametro para filtrar clientes
         self.token = None
         self._authenticate()
+        self.log_entries = []
 
     def _authenticate(self):
         auth_url = f"{self.url}/api/auth/login"
@@ -244,157 +246,6 @@ class ThingsBoardClient:
                 record_count += sum(1 for key, value in row.items() if key != 'timestamp' and value)
         return record_count
 
-
-    def download_telemetries(self):
-        tqdm.write("📥 Descargando telemetría de dispositivos...")
-        customers = self.get_customers()
-        if not customers:
-            tqdm.write(f"❌ No se encontraron clientes con el nombre especificado: {self.customer_name}")
-            return
-
-        base_directory = 'thingsboard_data'
-        report = []  # Lista para almacenar el reporte final de archivos descargados
-
-        for customer in tqdm(customers, desc="Clientes"):
-            customer_name = customer.get('title')
-            customer_id = customer.get('id')
-            customer_dir = os.path.join(base_directory, customer_name)
-            tqdm.write(f"📊 Procesando cliente: {customer_name}")
-
-            gateways = self.get_gateways_for_customer(customer_id)
-            if not gateways:
-                tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
-                continue
-
-            for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
-                gateway_name = gateway.get('name')
-                gateway_id = gateway.get('id').get('id')
-                gateway_dir = os.path.join(customer_dir, gateway_name)
-
-                devices = self.get_devices_for_gateway(gateway_id, customer_id)
-                if not devices:
-                    tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
-                    continue
-
-                for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
-                    device_name = device.get('name')
-                    device_id = device['id']['id']
-                    keys = self.get_telemetry_keys(device_id)
-
-                    device_dir = os.path.join(gateway_dir, device_name)
-                    csv_filename = os.path.join(device_dir, f"{device_name}_telemetry.csv")
-
-                    # 📌 Obtener el timestamp más antiguo y más reciente de ThingsBoard
-                    start_ts, end_ts = self.get_time_range(device_name,device_id, keys)
-                    if not start_ts or not end_ts:
-                        tqdm.write(f"⚠️ No hay registros de telemetría en ThingsBoard para '{device_name}', omitiendo descarga.")
-                        continue
-                    start_ts_delete = start_ts
-                    end_ts_delete = end_ts
-                    #tqdm.write(f"🕒 Registro más antiguo en ThingsBoard para '{device_name}': {datetime.fromtimestamp(start_ts / 1000, tz=datetime.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-                    #tqdm.write(f"🕒 Registro más reciente en ThingsBoard para '{device_name}': {datetime.fromtimestamp(end_ts / 1000, tz=datetime.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
-
-                    # Contar registros ya existentes en el CSV local
-                    existing_records = self.count_existing_records(csv_filename)
-
-                    # Mostrar la fecha y hora de la última telemetría almacenada en CSV
-                    last_telemetry_time = self.get_last_telemetry_timestamp(csv_filename)
-                    if last_telemetry_time and "UTC" in last_telemetry_time:
-                        last_telemetry_time = last_telemetry_time.replace(" UTC", "")  # 🛠️ Corrección aquí
-
-                    tqdm.write(f"🕒 Última telemetría registrada en CSV para '{device_name}': {last_telemetry_time}")
-
-                    # Convertir la última telemetría registrada en CSV a timestamp en milisegundos
-                    try:
-                        last_ts = int(datetime.strptime(last_telemetry_time, '%Y-%m-%d %H:%M:%S').timestamp() * 1000)
-                    except ValueError:
-                        tqdm.write(f"⚠️ Error al procesar la última telemetría, usando fecha predeterminada.")
-                        last_ts = int(datetime(2024, 9, 1).timestamp() * 1000)  # Fecha de inicio predeterminada
-
-                    # Definir el rango de descarga de telemetrías
-                    start_ts = last_ts + 1  # Evitar duplicados
-                    end_ts = int(datetime.now().timestamp() * 1000)  # Fecha actual como límite
-
-                    limit = 10000  # Reducir el número de registros por solicitud
-                    total_records = 0  # Para contar el número de registros (*timestamps * claves*)
-
-                    all_data = {}
-
-                    while True:
-                        url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries?limit={limit}&startTs={start_ts}&endTs={end_ts}&keys={','.join(keys)}"
-
-                        try:
-                            response = requests.get(url, headers=self._get_headers(), timeout=60)
-                            if response.status_code == 500:
-                                tqdm.write(f"⚠️ Dispositivo sin telemetría: {device_name}")
-                                break
-                            response.raise_for_status()
-                            data = response.json()
-
-                            if not data:
-                                tqdm.write(f"✅ No se encontraron más datos para {device_name}.")
-                                break
-
-                            for key in data:
-                                for entry in data[key]:
-                                    ts = entry['ts']
-                                    value = entry['value']
-                                    if ts not in all_data:
-                                        all_data[ts] = {}
-                                    all_data[ts][key] = value
-
-                            last_ts = max(entry['ts'] for key in data for entry in data[key])
-                            start_ts = last_ts + 1  # Evitar duplicados
-
-                        except requests.exceptions.RequestException as e:
-                            tqdm.write(f"❌ Error al descargar telemetría para '{device_name}': {e}")
-                            break
-
-                    if all_data:
-                        if not os.path.exists(device_dir):
-                            os.makedirs(device_dir)
-
-                        with open(csv_filename, 'a', newline='') as csvfile:
-                            all_keys = sorted(keys)
-                            fieldnames = ['timestamp'] + all_keys
-                            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-                            if os.stat(csv_filename).st_size == 0:
-                                writer.writeheader()
-
-                            for ts in sorted(all_data.keys()):
-                                utc_time = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-                                row = {'timestamp': utc_time.strftime('%Y-%m-%d %H:%M:%S UTC')}  # Manteniendo formato UTC
-                                for key in all_keys:
-                                    row[key] = all_data[ts].get(key, '')
-                                writer.writerow(row)
-
-                        total_records += existing_records  # Añadir los registros ya presentes
-
-                        file_size = os.path.getsize(csv_filename) / 1024  # Tamaño en KB
-                        tqdm.write(f"✅ Telemetría guardada en '{os.path.basename(csv_filename)}' con {total_records} registros.")
-                        report.append({
-                            'file': os.path.basename(csv_filename),
-                            'records': total_records,
-                            'size_kb': file_size
-                        })
-                         # Llamar a la función para procesar y calibrar
-                        calibration_file = os.path.join(device_dir, 'calibracion.json')
-                        self.process_and_calibrate_telemetry(csv_filename, calibration_file)
-
-                        # 🗑️ Borrar telemetrías de ThingsBoard
-                        tqdm.write(f"🗑️ Borrar telemetrías de dispositivo '{device_name}'")
-                        self.delete_telemetry(device_name, device_id, start_ts=start_ts_delete, end_ts=end_ts_delete)
-                    else:
-                        tqdm.write(f"⚠️ No se encontró telemetría para '{device_name}' en el rango de fechas especificado.")
-
-        # Mostrar el reporte final
-        tqdm.write("\n📊 Reporte final de archivos descargados:")
-        for entry in report:
-            tqdm.write(f"📁 Archivo: {entry['file']}, Registros: {entry['records']}, Tamaño: {entry['size_kb']:.2f} KB")
-
-
     def get_time_range(self, device_name,device_id, keys):
         """
         Obtiene el primer y último timestamp de los datos de telemetría para las claves especificadas,
@@ -411,7 +262,7 @@ class ThingsBoardClient:
         newest_timestamp = None  # Timestamp más reciente encontrado
 
         tqdm.write(f"📡 Iniciando búsqueda de telemetría para el dispositivo {device_name} desde {start_date.strftime('%Y-%m-%d')} hasta la fecha actual.")
-
+        self.log_entries.append(f"📡 Iniciando búsqueda de telemetría para el dispositivo {device_name} desde {start_date.strftime('%Y-%m-%d')} hasta la fecha actual.")
         # Barra de progreso para visualizar el proceso
         with tqdm(total=(end_date - start_date).days, desc="📅 Explorando días ", unit="día") as pbar:
             while current_date <= end_date:
@@ -439,7 +290,7 @@ class ThingsBoardClient:
                         if key in data and data[key]:  # Si hay datos para esta clave en este rango
                             key_oldest_ts = data[key][0]['ts']
                             tqdm.write(f"📍 Encontrado primer registro para '{key}': {datetime.fromtimestamp(key_oldest_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
+                            self.log_entries.append(f"📍 Encontrado primer registro para '{key}': {datetime.fromtimestamp(key_oldest_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
                             if oldest_timestamp is None or key_oldest_ts < oldest_timestamp:
                                 oldest_timestamp = key_oldest_ts
 
@@ -460,16 +311,19 @@ class ThingsBoardClient:
 
                     except requests.exceptions.RequestException as e:
                         tqdm.write(f"⚠️ Error al consultar la clave '{key}' entre {current_date.strftime('%Y-%m-%d')} y {next_date.strftime('%Y-%m-%d')}: {e}")
-
+                        self.log_entries.append(f"⚠️ Error al consultar la clave '{key}' entre {current_date.strftime('%Y-%m-%d')} y {next_date.strftime('%Y-%m-%d')}: {e}")
+                         
                 if oldest_timestamp and newest_timestamp:
                     tqdm.write("✅ Datos encontrados, deteniendo la búsqueda.")
+                    self.log_entries.append("✅ Datos encontrados, deteniendo la búsqueda.")
                     break  # Detenemos la búsqueda si hemos encontrado datos
 
                 current_date = next_date  # Avanzamos al siguiente día
                 pbar.update(1)  # Actualizamos la barra de progreso
 
         if oldest_timestamp is None or newest_timestamp is None:
-            tqdm.write(f"❌ No se encontraron datos de telemetría para {device_id} desde el 1 de octubre de 2024.")
+            tqdm.write(f"❌ No se encontraron datos de telemetría para {device_id} ")
+            self.log_entries.append(f"❌ No se encontraron datos de telemetría para {device_id} ")
             return None, None
 
         # Convertir timestamps a formato legible en UTC
@@ -477,8 +331,9 @@ class ThingsBoardClient:
         newest_readable = datetime.fromtimestamp(newest_timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
         tqdm.write(f"📍 Primer registro disponible:  {oldest_readable}")
+        self.log_entries.append(f"📍 Primer registro disponible:  {oldest_readable}")
         tqdm.write(f"📍 Último registro disponible:  {newest_readable}")
-
+        self.log_entries.append(f"📍 Último registro disponible:  {newest_readable}")
         return oldest_timestamp, newest_timestamp
 
 
@@ -525,12 +380,13 @@ class ThingsBoardClient:
         Descarga la telemetría de los dispositivos y fragmenta los archivos CSV en partes de máximo 10 MB.
         Luego, se aplica la calibración a cada fragmento.
         """
+       
         tqdm.write("\U0001F4E5 Descargando telemetría de dispositivos...")
         customers = self.get_customers()
         if not customers:
             tqdm.write(f"\u274C No se encontraron clientes con el nombre especificado: {self.customer_name}")
             return
-
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         base_directory = 'thingsboard_data'
         max_file_size = 10 * 1024 * 1024  # 10 MB en bytes
 
@@ -539,6 +395,7 @@ class ThingsBoardClient:
             customer_id = customer.get('id')
             customer_dir = os.path.join(base_directory, customer_name)
             tqdm.write(f"\U0001F4CA Procesando cliente: {customer_name}")
+            
 
             gateways = self.get_gateways_for_customer(customer_id)
             if not gateways:
@@ -553,6 +410,7 @@ class ThingsBoardClient:
                 devices = self.get_devices_for_gateway(gateway_id, customer_id)
                 if not devices:
                     tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
+                    self.log_entries.append(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
                     continue
 
                 for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
@@ -567,6 +425,7 @@ class ThingsBoardClient:
                     start_ts, end_ts = self.get_time_range(device_name, device_id, keys)
                     if not start_ts or not end_ts:
                         tqdm.write(f"⚠️ No hay registros de telemetría en ThingsBoard para '{device_name}', omitiendo descarga.")
+                        self.log_entries.append(f"⚠️ No hay registros de telemetría en ThingsBoard para '{device_name}', omitiendo descarga.")
                         continue
 
                     start_ts_download = start_ts
@@ -585,6 +444,7 @@ class ThingsBoardClient:
 
                             if not data:
                                 tqdm.write(f"✅ No se encontraron más datos para {device_name}.")
+                                self.log_entries.append(f"✅ No se encontraron más datos para {device_name}.")
                                 break
 
                             for key in data:
@@ -600,6 +460,7 @@ class ThingsBoardClient:
 
                         except requests.exceptions.RequestException as e:
                             tqdm.write(f"❌ Error al descargar telemetría para '{device_name}': {e}")
+                            self.log_entries.append(f"❌ Error al descargar telemetría para '{device_name}': {e}")
                             break
 
                         # Si hay datos, escribir en el archivo CSV con fragmentación
@@ -628,13 +489,24 @@ class ThingsBoardClient:
                                     break  # Salir del bucle si el tamaño es adecuado
 
                     tqdm.write(f"✅ Telemetría guardada en fragmentos de 10 MB para '{device_name}' en {device_dir}.")
-
+                    self.log_entries.append(f"✅ Telemetría guardada en fragmentos de 10 MB para '{device_name}' en {device_dir}.")
+                
                     # 📌 **Aplicar calibración a cada archivo generado**
                     for part_num in range(1, file_part + 1):
                         file_path = os.path.join(device_dir, f"{device_name}_telemetry_part{part_num}.csv")
                         if os.path.exists(file_path):
                             calibration_file = os.path.join(device_dir, "calibracion.json")  # Ruta del archivo de calibración
                             self.process_and_calibrate_telemetry(file_path, calibration_file)
+
+        log_dir = os.path.join(base_directory, 'logs')
+      
+        os.makedirs(log_dir, exist_ok=True)
+        log_filename = os.path.join(log_dir, f"download_report_{timestamp}.txt")
+        tqdm.write (f"{log_dir}-{log_filename}")
+        with open(log_filename, 'w') as log_file:
+            log_file.write("\n".join(self.log_entries))
+        self.send_email_with_attachment(log_filename)
+
 
 
     def get_time_range_fijo(self, device_id, keys):
@@ -665,11 +537,13 @@ class ThingsBoardClient:
 
             except requests.exceptions.RequestException as e:
                 tqdm.write(f"⚠️ Error al obtener el rango de tiempo para la clave {key}: {e}")
+                self.log_entries.append(f"✅ Telemetría guardada en fragmentos de 10 MB para '{device_name}' en {device_dir}.")
 
         # Si no se obtuvo `end_ts`, usar la fecha actual
         if end_ts is None:
             end_ts = int(datetime.now().timestamp() * 1000)
             tqdm.write(f"⚠️ No se encontró `end_ts`, usando la fecha actual: {datetime.utcfromtimestamp(end_ts / 1000)}")
+            self.log_entries.append(f"⚠️ No se encontró `end_ts`, usando la fecha actual: {datetime.utcfromtimestamp(end_ts / 1000)}")
 
         # 🚨 Evitar que `start_ts` sea mayor o igual que `end_ts`
         if start_ts >= end_ts:
@@ -682,6 +556,7 @@ class ThingsBoardClient:
 
         # Mostrar los rangos calculados
         tqdm.write(f"📊 Rango de tiempo calculado para {device_id}: Inicio fijo: {start_readable}, Fin: {end_readable}")
+        self.log_entries.append(f"📊 Rango de tiempo calculado para {device_id}: Inicio fijo: {start_readable}, Fin: {end_readable}")
 
         return start_ts, end_ts
 
@@ -700,6 +575,7 @@ class ThingsBoardClient:
 
         if partitioned_files:
             tqdm.write(f"📂 Se encontraron {len(partitioned_files)} archivos particionados. Aplicando calibración a cada uno...")
+            self.log_entries.append(f"📂 Se encontraron {len(partitioned_files)} archivos particionados. Aplicando calibración a cada uno...")
         else:
             partitioned_files = [csv_filename]  # Si no hay particionados, trabajar con el original
 
@@ -713,12 +589,15 @@ class ThingsBoardClient:
                 # Si el archivo de calibración es más reciente, recalibramos todos los archivos
                 if calib_mtime > csv_mtime:
                     tqdm.write(f"📌 Archivo de calibración más reciente encontrado. Recalibrando todos los archivos...")
+                    self.log_entries.append(f"📌 Archivo de calibración más reciente encontrado. Recalibrando todos los archivos...")
                     recalibrate_all = True
             except Exception as e:
                 tqdm.write(f"⚠️ Error al verificar el archivo de calibración: {e}")
+                self.log_entries.append(f"⚠️ Error al verificar el archivo de calibración: {e}")
                 return
         else:
             tqdm.write("⚠️ Archivo de calibración no encontrado. No se aplicarán ajustes.")
+            self.log_entries.append("⚠️ Archivo de calibración no encontrado. No se aplicarán ajustes.")
 
         # Generar la función de transferencia si hay un archivo de calibración
         transfer_function = None
@@ -727,6 +606,7 @@ class ThingsBoardClient:
                 transfer_function = self.generate_transfer_function(calibration_file)
             except Exception as e:
                 tqdm.write(f"⚠️ Error al procesar el archivo de calibración: {e}")
+                self.log_entries.append(f"⚠️ Error al procesar el archivo de calibración: {e}")
                 return
 
         # Procesar cada archivo (original o particionado)
@@ -787,6 +667,7 @@ class ThingsBoardClient:
                 writer.writerows(processed_rows)
 
             tqdm.write(f"✅ Archivo calibrado y guardado en: {calibrated_filename}")
+            self.log_entries.append(f"✅ Archivo calibrado y guardado en: {calibrated_filename}")
 
 
 
@@ -831,9 +712,11 @@ class ThingsBoardClient:
         Si no existe un archivo de calibración, se genera copiando 'current' y 'power'.
         """
         tqdm.write("📏 Aplicando calibración a archivos de telemetría...")
+        self.log_entries.append("📏 Aplicando calibración a archivos de telemetría...")
         customers = self.get_customers()
         if not customers:
             tqdm.write("❌ No se encontraron clientes para aplicar calibración.")
+            self.log_entries.append("❌ No se encontraron clientes para aplicar calibración.")
             return
 
         base_directory = 'thingsboard_data'
@@ -841,10 +724,11 @@ class ThingsBoardClient:
             customer_name = customer.get('title')
             customer_dir = os.path.join(base_directory, customer_name)
             tqdm.write(f"📊 Procesando cliente: {customer_name}")
-
+            self.log_entries.append(f"📊 Procesando cliente: {customer_name}")
             gateways = self.get_gateways_for_customer(customer.get('id'))
             if not gateways:
                 tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
+                self.log_entries.append(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
                 continue
 
             for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
@@ -854,6 +738,7 @@ class ThingsBoardClient:
                 devices = self.get_devices_for_gateway(gateway.get('id').get('id'), customer.get('id'))
                 if not devices:
                     tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
+                    self.log_entries.append(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
                     continue
 
                 for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
@@ -867,6 +752,7 @@ class ThingsBoardClient:
                     telemetry_files = sorted(glob.glob(f"{device_dir}/{device_name}_telemetry*.csv"))
                     if not telemetry_files:
                         tqdm.write(f"⚠️ No se encontraron archivos de telemetría para '{device_name}'.")
+                        self.log_entries.append(f"⚠️ No se encontraron archivos de telemetría para '{device_name}'.")
                         continue
 
                     # Archivo de calibración
@@ -882,6 +768,7 @@ class ThingsBoardClient:
             """
             if not os.path.exists(csv_filename):
                 tqdm.write(f"Archivo de telemetría no encontrado: {csv_filename}")
+                self.log_entries.append(f"Archivo de telemetría no encontrado: {csv_filename}")
                 return
 
             # Verificar si se debe recalibrar
@@ -892,12 +779,15 @@ class ThingsBoardClient:
                     csv_mtime = os.path.getmtime(csv_filename)
                     if calib_mtime > csv_mtime:
                         tqdm.write(f"Archivo de calibración más reciente encontrado. Recalibrando {csv_filename}...")
+                        self.log_entries.append(f"Archivo de calibración más reciente encontrado. Recalibrando {csv_filename}...")
                         recalibrate_all = True
                 except Exception as e:
                     tqdm.write(f"Error al verificar el archivo de calibración: {e}")
+                    self.log_entries.append(f"Error al verificar el archivo de calibración: {e}")
                     return
             else:
                 tqdm.write(f"⚠️ Archivo de calibración no encontrado. Creando uno con los datos existentes...")
+                self.log_entries.append(f"⚠️ Archivo de calibración no encontrado. Creando uno con los datos existentes...")
                 self.create_default_calibration(csv_filename, calibration_file)
                 return
 
@@ -939,6 +829,7 @@ class ThingsBoardClient:
                 writer.writerows(processed_rows)
 
             tqdm.write(f"✅ Archivo calibrado y guardado en: {calibrated_filename}")
+            self.log_entries.append(f"✅ Archivo calibrado y guardado en: {calibrated_filename}")
 
     def create_default_calibration(self, csv_filename, calibration_file):
         """
@@ -961,6 +852,7 @@ class ThingsBoardClient:
             json.dump(calibration_data, f, indent=4)
 
         tqdm.write(f"✅ Archivo de calibración creado: {calibration_file}")
+        self.log_entries.append(f"✅ Archivo de calibración creado: {calibration_file}")
 
 
     def remove_calibrated_files(self):
@@ -971,6 +863,7 @@ class ThingsBoardClient:
         customers = self.get_customers()
         if not customers:
             tqdm.write("❌ No se encontraron clientes para eliminar calibraciones.")
+            self.log_entries.append("❌ No se encontraron clientes para eliminar calibraciones.")
             return
 
         base_directory = 'thingsboard_data'
@@ -978,10 +871,12 @@ class ThingsBoardClient:
             customer_name = customer.get('title')
             customer_dir = os.path.join(base_directory, customer_name)
             tqdm.write(f"📊 Procesando cliente: {customer_name}")
+            self.log_entries.append(f"📊 Procesando cliente: {customer_name}")
 
             gateways = self.get_gateways_for_customer(customer.get('id'))
             if not gateways:
                 tqdm.write(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
+                self.log_entries.append(f"⚠️ No se encontraron gateways para el cliente {customer_name}")
                 continue
 
             for gateway in tqdm(gateways, desc=f"Gateways de {customer_name}", leave=False):
@@ -991,6 +886,7 @@ class ThingsBoardClient:
                 devices = self.get_devices_for_gateway(gateway.get('id').get('id'), customer.get('id'))
                 if not devices:
                     tqdm.write(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
+                    self.log_entries.append(f"⚠️ No se encontraron dispositivos para el gateway {gateway_name}")
                     continue
 
                 for device in tqdm(devices, desc=f"Dispositivos de {gateway_name}", leave=False):
@@ -1004,6 +900,7 @@ class ThingsBoardClient:
                     cal_files = sorted(glob.glob(f"{device_dir}/{device_name}_telemetry*_cal.csv"))
                     if not cal_files:
                         tqdm.write(f"⚠️ No se encontraron archivos calibrados para '{device_name}'.")
+                        self.log_entries.append(f"⚠️ No se encontraron archivos calibrados para '{device_name}'.")
                         continue
 
                     # Eliminar archivos calibrados
@@ -1011,18 +908,55 @@ class ThingsBoardClient:
                         try:
                             os.remove(file)
                             tqdm.write(f"🗑️ Eliminado: {file}")
+                            self.log_entries.append(f"🗑️ Eliminado: {file}")
                         except Exception as e:
                             tqdm.write(f"❌ Error al eliminar {file}: {e}")
+                            self.log_entries.append(f"❌ Error al eliminar {file}: {e}")
 
         tqdm.write("✅ Proceso de eliminación de archivos de calibración finalizado.")
+        self.log_entries.append("✅ Proceso de eliminación de archivos de calibración finalizado.")
+      
+    def send_email_with_attachment(self, file_path):
+        """
+        Envía un correo con el archivo de log adjunto.
+        """
+        smtp_server = "mail.iberiotek.com"
+        smtp_port = 587
+        sender_email = "oscar.gutierrez@ilexenergy.es"
+        receiver_email = "oscar.gutierrez@ilexenergy.es"
+        smtp_username = "oscar.gutierrez@ilexenergy.es"
+        smtp_password = "Osquillar$49"
 
-   
+        msg = EmailMessage()
+        msg['Subject'] = "📊 Reporte de Descarga de Telemetría"
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+        msg.set_content("Adjunto el reporte de descarga de telemetría.")
+
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+            file_name = os.path.basename(file_path)
+            msg.add_attachment(file_data, maintype='application', subtype='octet-stream', filename=file_name)
+
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_username, smtp_password)
+                server.send_message(msg)
+                tqdm.write(f"✉️ Correo enviado a {receiver_email} con el archivo {file_name}")
+               
+        except Exception as e:
+            tqdm.write(f"❌ Error enviando correo: {e}")
+          
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ThingsBoard Data Organizer')
     parser.add_argument('command', choices=['organize', 'download','tree','calibracion','uncal'], help='Command to execute')
     parser.add_argument('--customer', type=str, help='Nombre del cliente para filtrar')
 
     args = parser.parse_args()
+   
 
     client = ThingsBoardClient(customer_name=args.customer)
 
