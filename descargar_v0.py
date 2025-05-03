@@ -229,7 +229,100 @@ class ThingsBoardClient:
         return "Sin telemetría previa."
 
 
+    def delete_telemetry(self, device_name, device_id, start_ts=None, end_ts=None):
+        '''
+        Elimina telemetrías de un dispositivo en un rango de fechas. 
+        Si falla con el rango inicial, se reduce hasta llegar a 1 día.
+        Si falla con 1 día, se hace eliminación clave por clave.
+        '''
+        # Obtener todas las claves de telemetría
+        keys = self.get_telemetry_keys(device_id)
+        if not keys:
+            tqdm.write(f"❌ No se encontraron claves de telemetría para {device_name}. No se puede eliminar.")
+            return
+        # Obtener rango de tiempo si no se proporciona
 
+        if start_ts is None or end_ts is None:
+            calculated_start_ts, calculated_end_ts = self.get_time_range(device_id, keys)
+            start_ts = start_ts or calculated_start_ts
+            end_ts = end_ts or calculated_end_ts
+
+        # Validar rangos de tiempo
+        if start_ts is None or end_ts is None:
+            tqdm.write(f"❌ No se pudo determinar un rango de tiempo para eliminar datos de {device_name}.")
+            return
+        
+        if start_ts >= end_ts:
+            tqdm.write(f"🚨 ERROR: start_ts ({start_ts}) es mayor o igual que end_ts ({end_ts}). No se eliminarán telemetrías.")
+            return
+        
+        # Rango de eliminación progresiva
+        delete_windows = [30, 15, 7, 3, 1]  # Días
+        min_window_reached = False  # Flag para detectar cuando llegamos a 1 día
+        current_window = delete_windows[0]
+
+        # Convertir timestamps a formato UTC legible
+        start_readable = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        end_readable = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        tqdm.write(f"🗑️ Iniciando borrado de telemetrías para '{device_name}' entre {start_readable} y {end_readable}")
+
+        while current_window > 0:
+            # Intentar borrar todas las claves con el rango actual
+            window_end_ts = start_ts + (current_window * 24 * 60 * 60 * 1000)  # Convertir días a ms
+            if window_end_ts > end_ts:
+                window_end_ts = end_ts  # Ajustar si excede el rango disponible
+            tqdm.write(f"🔹 Intentando borrar datos entre {datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(window_end_ts / 1000, tz=timezone.utc)} ({current_window} días)")
+            url = f"{self.url}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/delete"
+            headers = self._get_headers()
+
+            try:
+                response = requests.delete(url, headers=headers, params={'keys': ','.join(keys), 'startTs': start_ts, 'endTs': window_end_ts})
+                if response.status_code == 200:
+                    tqdm.write(f"✅ Borrado exitoso de telemetrías entre {start_readable} y {end_readable}.")
+                    start_ts = window_end_ts + 1  # Avanzar al siguiente bloque de tiempo
+                    if start_ts >= end_ts:
+                        break  # Fin del proceso de eliminación
+ 
+                    continue  # Repetir el proceso con el siguiente bloque
+                else:
+                    tqdm.write(f"⚠️ Error en la eliminación: {response.status_code} - {response.text}")
+            except requests.exceptions.RequestException as e:
+                tqdm.write(f"⚠️ Error en la solicitud de eliminación: {e}")
+
+     # Si falló, reducir la ventana de tiempo
+            delete_windows.pop(0)
+            if delete_windows:
+                current_window = delete_windows[0]  # Pasar al siguiente rango menor
+            else:
+                min_window_reached = True
+                break  # Salir del bucle      
+
+               # Si llegamos a la ventana mínima (1 día) sin éxito, intentar clave por clave
+
+        if min_window_reached:
+            tqdm.write(f"🔻 No se pudo eliminar con el rango mínimo. Intentando eliminación clave por clave...")
+            for key in tqdm(keys, desc="Borrando claves", unit="claves"):
+                key_start_ts = start_ts  # Reiniciar para cada clave
+                while key_start_ts < end_ts:
+                    key_end_ts = key_start_ts + (1 * 24 * 60 * 60 * 1000)  # 1 día en ms
+                    if key_end_ts > end_ts:
+                        key_end_ts = end_ts  # Ajustar límite     
+
+                    tqdm.write(f"🔹 Intentando borrar '{key}' entre {datetime.fromtimestamp(key_start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(key_end_ts / 1000, tz=timezone.utc)}")
+
+                    try:
+                        response = requests.delete(url, headers=headers, params={'keys': key, 'startTs': key_start_ts, 'endTs': key_end_ts})
+                        if response.status_code == 200:
+                            tqdm.write(f"✅ Borrado exitoso de '{key}' entre {datetime.fromtimestamp(key_start_ts / 1000, tz=timezone.utc)} y {datetime.fromtimestamp(key_end_ts / 1000, tz=timezone.utc)}")
+                        else:
+                            tqdm.write(f"⚠️ Error al borrar '{key}': {response.status_code} - {response.text}")
+ 
+                    except requests.exceptions.RequestException as e:
+                        tqdm.write(f"⚠️ Error en la solicitud de eliminación para '{key}': {e}")
+
+                    key_start_ts = key_end_ts + 1  # Avanzar al siguiente bloque de tiempo
+
+        tqdm.write(f"🗑️ Proceso de eliminación de telemetrías finalizado para '{device_name}'.")
 
     def count_existing_records(self, csv_filename):
         """
@@ -497,6 +590,8 @@ class ThingsBoardClient:
                         if os.path.exists(file_path):
                             calibration_file = os.path.join(device_dir, "calibracion.json")  # Ruta del archivo de calibración
                             self.process_and_calibrate_telemetry(file_path, calibration_file)
+                    
+                    self.delete_telemetry( device_name, device_id, start_ts, end_ts)
 
         log_dir = os.path.join(base_directory, 'logs')
       
@@ -781,6 +876,9 @@ class ThingsBoardClient:
                         tqdm.write(f"Archivo de calibración más reciente encontrado. Recalibrando {csv_filename}...")
                         self.log_entries.append(f"Archivo de calibración más reciente encontrado. Recalibrando {csv_filename}...")
                         recalibrate_all = True
+                    else: 
+                        #tqdm.write("Archivo de calibracion sin cambios")       
+                        return
                 except Exception as e:
                     tqdm.write(f"Error al verificar el archivo de calibración: {e}")
                     self.log_entries.append(f"Error al verificar el archivo de calibración: {e}")
